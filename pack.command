@@ -26,10 +26,13 @@ echo "正在打包，请稍候（首次打包较慢）…"
 echo ""
 
 # --windowed 让 app 没有终端黑窗；--add-data 携带图片与 readme
+# --collect-submodules maidchan 确保拆分后的所有子模块都被打包进去
 python -m PyInstaller \
     --noconfirm \
     --windowed \
     --name "Maid-chan" \
+    --icon "pic/app-icon.png" \
+    --collect-submodules maidchan \
     --add-data "pic:pic" \
     --add-data "readme.md:." \
     oc.py

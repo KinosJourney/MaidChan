@@ -25,10 +25,13 @@ echo 正在打包，请稍候（首次打包较慢）...
 echo.
 
 REM --windowed 不弹黑窗；--add-data 用分号分隔（Windows）
+REM --collect-submodules maidchan 确保拆分后的所有子模块都被打包进去
 python -m PyInstaller ^
     --noconfirm ^
     --windowed ^
     --name "Maid-chan" ^
+    --icon "pic\app-icon.png" ^
+    --collect-submodules maidchan ^
     --add-data "pic;pic" ^
     --add-data "readme.md;." ^
     oc.py
