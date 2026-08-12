@@ -1,0 +1,7 @@
+# Maid-chan 桌宠所需的 Python 依赖
+# 一键安装：运行 install.command (macOS) 或 install.bat (Windows)
+
+PySide6>=6.5,<6.9
+requests>=2.28,<3.0
+Pillow>=9.0,<12.0
+pyinstaller>=6.0,<7.0
