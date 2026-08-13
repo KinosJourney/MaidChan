@@ -6,6 +6,7 @@ import random
 import subprocess
 import sys
 import time
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +32,8 @@ from PySide6.QtWidgets import (
 
 from ..config.constants import (
     CHARACTER_HEIGHT,
+    DEFAULT_PLAYLIST_HOTKEY,
+    DEFAULT_PLAYLIST_URL,
     DEFAULT_SYSTEM_PROMPT,
     MAX_CONTEXT_TURNS,
 )
@@ -38,6 +41,13 @@ from ..config.paths import HISTORY_PATH, IMG_BLINK, IMG_OPEN, IMG_ORIGIN
 from ..core import CharacterStateMachine, NotificationManager, Scheduler
 from ..llm.client import ChatWorker
 from ..llm.messages import build_chat_messages
+from ..playlist import (
+    GlobalHotkey,
+    PlaylistWorker,
+    hotkey_display,
+    qt_key_sequence,
+    short_title,
+)
 from ..storage.history import HistoryStore
 from ..storage.profile import Profile
 from ..storage.settings import Settings
@@ -166,6 +176,11 @@ class MaidPet(QWidget):
         self._drag_pos = None
 
         self.worker = None
+
+        self._playlist_worker = None
+        self._last_playlist_bvid = None
+        self._last_playlist_at = 0.0
+        self._setup_playlist_shortcut()
 
         # 恢复窗口位置
         self.adjustSize()
@@ -317,6 +332,62 @@ class MaidPet(QWidget):
         name = self.profile.get("call_me") or "主人"
         self.show_local("时间到啦，%s！休息 5 分钟，起来走动一下吧～" % name)
 
+    # ===================== 合集随机播放 =====================
+    def _setup_playlist_shortcut(self):
+        seq = qt_key_sequence(DEFAULT_PLAYLIST_HOTKEY)
+        self.act_playlist = QAction(
+            "随机播放合集（%s）" % hotkey_display(DEFAULT_PLAYLIST_HOTKEY), self
+        )
+        self.act_playlist.setShortcut(seq)
+        self.act_playlist.setShortcutContext(Qt.ApplicationShortcut)
+        self.act_playlist.setShortcutVisibleInContextMenu(False)
+        self.act_playlist.triggered.connect(self.play_random_from_playlist)
+        self.addAction(self.act_playlist)
+
+        self._global_hotkey = GlobalHotkey(
+            DEFAULT_PLAYLIST_HOTKEY, widget=self, parent=self
+        )
+        self._global_hotkey.activated.connect(self.play_random_from_playlist)
+
+    def play_random_from_playlist(self):
+        if self._playlist_worker is not None and self._playlist_worker.isRunning():
+            return
+        now = time.time()
+        if now - self._last_playlist_at < 1.0:
+            return
+        self._last_playlist_at = now
+
+        url = self.settings.get("playlist_url", DEFAULT_PLAYLIST_URL)
+        self.show_local("我去合集里抽一条～")
+        self._playlist_worker = PlaylistWorker(
+            url, exclude_bvid=self._last_playlist_bvid, parent=self
+        )
+        self._playlist_worker.finished_ok.connect(self._on_playlist_ready)
+        self._playlist_worker.failed.connect(self._on_playlist_failed)
+        self._playlist_worker.start()
+
+    def _on_playlist_ready(self, video):
+        url = video.get("url")
+        if not url:
+            self._on_playlist_failed("没有拿到视频地址。")
+            return
+        self._last_playlist_bvid = video.get("bvid")
+        try:
+            webbrowser.open(url, new=2)
+        except Exception:
+            self.show_local("浏览器打不开呢，链接是：%s" % url)
+            return
+        title = short_title(video.get("title") or "")
+        self.show_local("给你抽到了《%s》，一起看吧～" % title)
+
+    def _on_playlist_failed(self, err):
+        fallback = self.settings.get("playlist_url", DEFAULT_PLAYLIST_URL)
+        try:
+            webbrowser.open(fallback, new=2)
+        except Exception:
+            pass
+        self.show_local("%s。先帮你打开合集页面啦～" % err.rstrip("。～ "))
+
     # ===================== 右键菜单 =====================
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -352,6 +423,8 @@ class MaidPet(QWidget):
         act_pomo = QAction(pomo_text, self)
         act_pomo.triggered.connect(self.toggle_pomodoro)
         menu.addAction(act_pomo)
+
+        menu.addAction(self.act_playlist)
 
         menu.addSeparator()
 
@@ -392,14 +465,17 @@ class MaidPet(QWidget):
         dlg.exec()
 
     def open_settings(self):
-        dlg = SettingsDialog(self.settings, on_saved=self._on_prompt_saved, parent=self)
+        dlg = SettingsDialog(self.settings, on_saved=self._on_settings_saved, parent=self)
         dlg.exec()
 
-    def _on_prompt_saved(self):
-        # 立即更新内存 prompt，并重置短期上下文（清空发给 API 的历史）
-        self.system_prompt = self.settings.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
-        self.history.clear()
-        self.show_local("新的人设我记住啦～之前的对话上下文已经重置。")
+    def _on_settings_saved(self, prompt_changed=True):
+        if prompt_changed:
+            # 立即更新内存 prompt，并重置短期上下文（清空发给 API 的历史）
+            self.system_prompt = self.settings.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+            self.history.clear()
+            self.show_local("新的人设我记住啦～之前的对话上下文已经重置。")
+        else:
+            self.show_local("设置已保存。下次随机播放会用新的合集哦～")
 
     def open_profile(self):
         dlg = ProfileDialog(self.profile, on_saved=self._on_profile_saved, parent=self)
@@ -517,6 +593,10 @@ class MaidPet(QWidget):
     def _teardown(self):
         """统一清理：停止全部定时任务、等待后台请求结束、关闭气泡。"""
         self.scheduler.shutdown()
+        if self._global_hotkey is not None:
+            self._global_hotkey.unregister()
+        if self._playlist_worker is not None and self._playlist_worker.isRunning():
+            self._playlist_worker.wait(2000)
         if self.worker is not None and self.worker.isRunning():
             self.worker.wait(3000)
         self.bubble.close()

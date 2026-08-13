@@ -33,3 +33,9 @@ MOUTH_ANIM_MS = 140
 
 # 记忆保留的最大轮数（用于发给 API 的上下文，1 轮=1问1答）
 MAX_CONTEXT_TURNS = 12
+
+# B 站合集随机播放（快捷键为物理 Control+Shift+P，Mac 上不是 Command）
+DEFAULT_PLAYLIST_URL = (
+    "https://space.bilibili.com/599873511/channel/collectiondetail?sid=6665575"
+)
+DEFAULT_PLAYLIST_HOTKEY = "Ctrl+Shift+P"

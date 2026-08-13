@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """程序设置存储。"""
 
-from ..config.constants import DEFAULT_SYSTEM_PROMPT
+from ..config.constants import (
+    DEFAULT_PLAYLIST_URL,
+    DEFAULT_SYSTEM_PROMPT,
+)
 from ..config.paths import CONFIG_PATH
 from .json_io import load_json, save_json
 
@@ -16,6 +19,7 @@ class Settings:
         self.data.setdefault("show_input", True)
         self.data.setdefault("pos_x", None)
         self.data.setdefault("pos_y", None)
+        self.data.setdefault("playlist_url", DEFAULT_PLAYLIST_URL)
 
     def get(self, key, default=None):
         return self.data.get(key, default)
