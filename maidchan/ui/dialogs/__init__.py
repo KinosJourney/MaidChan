@@ -3,7 +3,14 @@
 
 from .help_dialog import HelpDialog
 from .history_dialog import HistoryDialog
+from .pomodoro_dialog import PomodoroDialog
 from .profile_dialog import ProfileDialog
 from .settings_dialog import SettingsDialog
 
-__all__ = ["HistoryDialog", "SettingsDialog", "ProfileDialog", "HelpDialog"]
+__all__ = [
+    "HistoryDialog",
+    "PomodoroDialog",
+    "SettingsDialog",
+    "ProfileDialog",
+    "HelpDialog",
+]

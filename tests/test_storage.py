@@ -11,6 +11,7 @@ import unittest
 
 from maidchan.storage.json_io import load_json, save_json
 from maidchan.storage.history import HistoryStore
+from maidchan.storage.pomodoro_stats import PomodoroStats
 from maidchan.storage.profile import Profile
 from maidchan.llm.messages import build_chat_messages
 from maidchan.ui.text_utils import split_sentences
@@ -143,6 +144,61 @@ class ProfilePrefixTest(TempDirTestCase):
         p = Profile.__new__(Profile)
         p.data = {}
         self.assertEqual(p.as_prompt_prefix(), "")
+
+
+class PomodoroStatsTest(TempDirTestCase):
+    def _store(self):
+        return PomodoroStats(os.path.join(self.tmp, "pomodoro_stats.json"))
+
+    def test_first_completion(self):
+        s = self._store()
+        self.assertEqual(s.today_count, 0)
+        result = s.record_completion()
+        self.assertEqual(result, 1)
+        self.assertEqual(s.today_count, 1)
+
+    def test_multiple_completions_same_day(self):
+        s = self._store()
+        s.record_completion()
+        s.record_completion()
+        s.record_completion()
+        self.assertEqual(s.today_count, 3)
+
+    def test_cross_day_rollover(self):
+        path = os.path.join(self.tmp, "pomodoro_stats.json")
+        save_json(path, {"date": "2000-01-01", "count": 5})
+        s = PomodoroStats(path)
+        self.assertEqual(s.today_count, 0)
+
+    def test_persistence_reload(self):
+        path = os.path.join(self.tmp, "pomodoro_stats.json")
+        s1 = PomodoroStats(path)
+        s1.record_completion()
+        s1.record_completion()
+        s2 = PomodoroStats(path)
+        self.assertEqual(s2.today_count, 2)
+
+    def test_corrupted_json_recovers(self):
+        path = os.path.join(self.tmp, "pomodoro_stats.json")
+        with open(path, "w") as f:
+            f.write("NOT JSON")
+        s = PomodoroStats(path)
+        self.assertEqual(s.today_count, 0)
+        s.record_completion()
+        self.assertEqual(s.today_count, 1)
+
+    def test_invalid_structure_recovers(self):
+        path = os.path.join(self.tmp, "pomodoro_stats.json")
+        save_json(path, [1, 2, 3])
+        s = PomodoroStats(path)
+        self.assertEqual(s.today_count, 0)
+
+    def test_negative_count_sanitized(self):
+        path = os.path.join(self.tmp, "pomodoro_stats.json")
+        from datetime import date
+        save_json(path, {"date": date.today().isoformat(), "count": -5})
+        s = PomodoroStats(path)
+        self.assertEqual(s.today_count, 0)
 
 
 class SplitSentencesTest(unittest.TestCase):

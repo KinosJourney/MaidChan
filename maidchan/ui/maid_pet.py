@@ -50,8 +50,9 @@ from ..playlist import (
 )
 from ..storage.history import HistoryStore
 from ..storage.profile import Profile
+from ..storage.pomodoro_stats import PomodoroStats
 from ..storage.settings import Settings
-from .dialogs import HelpDialog, HistoryDialog, ProfileDialog, SettingsDialog
+from .dialogs import HelpDialog, HistoryDialog, PomodoroDialog, ProfileDialog, SettingsDialog
 from .image_loader import pixmap_from_image_dewhite
 from .speech_bubble import SpeechBubble
 from .text_utils import split_sentences
@@ -169,8 +170,26 @@ class MaidPet(QWidget):
         self._idle_greeted = False
         self.scheduler.schedule_repeating("idle", 30000, self._check_idle)
 
-        # 番茄钟
-        self.pomodoro_active = False
+        # 番茄钟：倒计时标签贴在角色旁边
+        self._pomodoro_stats = PomodoroStats()
+        self._pomo_label = QLabel(self)
+        self._pomo_label.setStyleSheet(
+            "QLabel {"
+            "  background: rgba(255,183,197,0.88);"
+            "  color: white; font-size: 14px; font-weight: bold;"
+            "  font-family: 'Menlo', 'Consolas', monospace;"
+            "  border-radius: 10px; padding: 3px 8px;"
+            "}"
+        )
+        self._pomo_label.setAlignment(Qt.AlignCenter)
+        self._pomo_label.hide()
+        self._pomodoro_dialog = PomodoroDialog(
+            stats=self._pomodoro_stats,
+            on_complete=self._pomodoro_done,
+            on_tick=self._pomodoro_tick,
+            on_state_change=self._pomodoro_state_changed,
+            parent=None,
+        )
 
         # 拖拽
         self._drag_pos = None
@@ -317,20 +336,30 @@ class MaidPet(QWidget):
             self.show_local(random.choice(tips))
 
     # ===================== 番茄钟 =====================
-    def toggle_pomodoro(self):
-        if self.pomodoro_active:
-            self.scheduler.cancel("pomodoro")
-            self.pomodoro_active = False
-            self.show_local("好的，专注计时已取消～")
-        else:
-            self.scheduler.schedule_once("pomodoro", 25 * 60 * 1000, self._pomodoro_done)
-            self.pomodoro_active = True
-            self.show_local("专注模式开始！我会在 25 分钟后提醒你休息，加油～")
+    def open_pomodoro(self):
+        self._pomodoro_dialog.show_and_raise()
 
-    def _pomodoro_done(self):
-        self.pomodoro_active = False
+    def _pomodoro_tick(self, time_text):
+        self._pomo_label.setText(time_text)
+        self._position_pomo_label()
+
+    def _pomodoro_state_changed(self, running):
+        if running:
+            self._pomo_label.show()
+        else:
+            self._pomo_label.hide()
+
+    def _position_pomo_label(self):
+        self._pomo_label.adjustSize()
+        cx = self.char_label.x() + self.char_label.width() - self._pomo_label.width() - 2
+        cy = self.char_label.y() + 30
+        self._pomo_label.move(cx, cy)
+
+    def _pomodoro_done(self, count):
         name = self.profile.get("call_me") or "主人"
-        self.show_local("时间到啦，%s！休息 5 分钟，起来走动一下吧～" % name)
+        self.show_local(
+            "时间到啦，%s！休息一下吧～今天已经完成 %d 个番茄了，真棒！" % (name, count)
+        )
 
     # ===================== 合集随机播放 =====================
     def _setup_playlist_shortcut(self):
@@ -419,9 +448,9 @@ class MaidPet(QWidget):
         act_greet.triggered.connect(self.greet)
         menu.addAction(act_greet)
 
-        pomo_text = "取消专注计时" if self.pomodoro_active else "开始专注计时(25分钟)"
+        pomo_text = "番茄钟（进行中…）" if self._pomodoro_dialog.is_running else "番茄钟…"
         act_pomo = QAction(pomo_text, self)
-        act_pomo.triggered.connect(self.toggle_pomodoro)
+        act_pomo.triggered.connect(self.open_pomodoro)
         menu.addAction(act_pomo)
 
         menu.addAction(self.act_playlist)
@@ -599,6 +628,7 @@ class MaidPet(QWidget):
             self._playlist_worker.wait(2000)
         if self.worker is not None and self.worker.isRunning():
             self.worker.wait(3000)
+        self._pomodoro_dialog.close()
         self.bubble.close()
 
     # ===================== 拖拽移动 =====================
