@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """主窗口：桌宠本体。"""
 
+import os
 import random
+import subprocess
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QPoint
 from PySide6.QtGui import (
@@ -364,6 +367,14 @@ class MaidPet(QWidget):
         act_mute.triggered.connect(self.toggle_mute)
         menu.addAction(act_mute)
 
+        if sys.platform == "darwin":
+            autostart_on = self._is_autostart_enabled()
+            act_autostart = QAction(
+                "关闭开机启动" if autostart_on else "开启开机启动", self
+            )
+            act_autostart.triggered.connect(self.toggle_autostart)
+            menu.addAction(act_autostart)
+
         act_clear = QAction("清空聊天记忆", self)
         act_clear.triggered.connect(self.clear_memory)
         menu.addAction(act_clear)
@@ -421,6 +432,74 @@ class MaidPet(QWidget):
 
     def toggle_mute(self):
         self.settings.set("mute_anim", not self.settings.get("mute_anim", False))
+
+    # ===================== 开机启动（macOS LaunchAgent） =====================
+
+    _LAUNCHAGENT_LABEL = "com.maidchan.desktop-pet"
+
+    @property
+    def _plist_path(self) -> Path:
+        return Path.home() / "Library" / "LaunchAgents" / f"{self._LAUNCHAGENT_LABEL}.plist"
+
+    @property
+    def _project_dir(self) -> Path:
+        """项目根目录（oc.py 所在目录）。"""
+        return Path(__file__).resolve().parent.parent.parent
+
+    def _is_autostart_enabled(self) -> bool:
+        return self._plist_path.is_file()
+
+    def toggle_autostart(self):
+        if self._is_autostart_enabled():
+            self._disable_autostart()
+            self.show_local("开机启动已关闭～下次登录不会自动启动了。")
+        else:
+            self._enable_autostart()
+            self.show_local("开机启动已开启！下次登录 Mac 会自动启动哦～")
+
+    def _enable_autostart(self):
+        project = self._project_dir
+        python_bin = project / ".venv" / "bin" / "python"
+        script = project / "oc.py"
+        log_file = project / "maidchan-launch.log"
+
+        plist_content = f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{self._LAUNCHAGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python_bin}</string>
+        <string>{script}</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{project}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONIOENCODING</key>
+        <string>utf-8</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{log_file}</string>
+    <key>StandardErrorPath</key>
+    <string>{log_file}</string>
+</dict>
+</plist>
+"""
+        self._plist_path.parent.mkdir(parents=True, exist_ok=True)
+        self._plist_path.write_text(plist_content, encoding="utf-8")
+
+    def _disable_autostart(self):
+        if self._plist_path.is_file():
+            subprocess.run(["launchctl", "unload", str(self._plist_path)],
+                           capture_output=True)
+            self._plist_path.unlink(missing_ok=True)
 
     def clear_memory(self):
         ret = QMessageBox.question(
