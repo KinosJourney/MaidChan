@@ -50,6 +50,8 @@ DATA_DIR = user_data_dir()
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 PROFILE_PATH = os.path.join(DATA_DIR, "profile.json")
 HISTORY_PATH = os.path.join(DATA_DIR, "history.json")
+MEMORY_PATH = os.path.join(DATA_DIR, "memories.json")
+MEMORY_BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 POMODORO_STATS_PATH = os.path.join(DATA_DIR, "pomodoro_stats.json")
 
 PIC_DIR = os.path.join(resource_dir(), "pic")

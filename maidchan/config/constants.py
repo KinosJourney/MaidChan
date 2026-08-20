@@ -32,11 +32,20 @@ TYPE_SPEED_MS = 55
 MOUTH_ANIM_MS = 140
 
 # 记忆保留的最大轮数（用于发给 API 的上下文，1 轮=1问1答）
-MAX_CONTEXT_TURNS = 12
+MAX_CONTEXT_TURNS = 6
+
+# 会话超时：超过此时间（秒）未互动，视为新会话，不携带旧上下文
+SESSION_TIMEOUT_SECONDS = 7200  # 2 小时
+
+# 长期记忆
+MAX_MEMORY_INJECT = 5          # 每次注入 prompt 的最大记忆条数
+MAX_MEMORY_TOTAL = 99999         # 记忆库总条数上限（超出后自动淘汰最不重要的），基本不会触发
+MAX_MEMORY_CONTENT_LEN = 100   # 单条记忆内容最大字符数（提取时截断）
+MAX_MEMORY_INJECT_TOKENS = 600 # 注入 prompt 的记忆文本最大字符总数
 
 # B 站合集随机播放（快捷键为物理 Control+Shift+P，Mac 上不是 Command）
 DEFAULT_PLAYLIST_URL = (
-    "https://space.bilibili.com/599873511/channel/collectiondetail?sid=6665575"
+    "https://space.bilibili.com/599873511/lists/4747084?type=season"
 )
 DEFAULT_PLAYLIST_HOTKEY = "Ctrl+Shift+P"
 
@@ -45,3 +54,22 @@ DEFAULT_POMODORO_MINUTES = 25
 POMODORO_PRESETS = [15, 25, 45, 60]
 POMODORO_MIN_MINUTES = 1
 POMODORO_MAX_MINUTES = 120
+
+# 番茄钟休息时长
+DEFAULT_REST_MINUTES = 5
+REST_PRESETS = [3, 5, 10]
+REST_MIN_MINUTES = 1
+REST_MAX_MINUTES = 60
+
+# 语音识别（兼容 OpenAI Whisper / Groq / 硅基流动 / 本地 whisper-server）
+DEFAULT_STT_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_STT_MODEL = "whisper-1"
+DEFAULT_STT_LANGUAGE = "zh"
+MAX_RECORDING_SECONDS = 60
+
+# 科学工作法快速配置：(名称, 专注分钟, 休息分钟, 说明)
+WORK_METHODS = [
+    ("番茄工作法", 25, 5, "25 分钟专注 + 5 分钟休息，经典入门"),
+    ("52/17 法则", 52, 17, "52 分钟专注 + 17 分钟休息，兼顾专注与恢复"),
+    ("90 分钟周期", 90, 25, "顺应身体节律，适合深度工作"),
+]

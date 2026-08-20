@@ -3,6 +3,7 @@
 
 import sys
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QLabel,
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
 from ...config.constants import (
     DEFAULT_PLAYLIST_HOTKEY,
     DEFAULT_PLAYLIST_URL,
+    DEFAULT_STT_BASE_URL,
     DEFAULT_SYSTEM_PROMPT,
 )
 from ...playlist.hotkey import hotkey_display
@@ -29,7 +31,7 @@ class SettingsDialog(QDialog):
         self.settings = settings
         self.on_saved = on_saved
         self.setWindowTitle("设置 · 人设")
-        self.resize(560, 580)
+        self.resize(560, 700)
 
         layout = QVBoxLayout(self)
 
@@ -61,6 +63,34 @@ class SettingsDialog(QDialog):
             note.setStyleSheet("color: #8a6a73; font-size: 12px;")
             layout.addWidget(note)
 
+        # ─── 语音输入设置 ───
+        stt_sep = QLabel("─── 语音输入 ───")
+        stt_sep.setAlignment(Qt.AlignCenter)
+        stt_sep.setStyleSheet("color: #c0a0b0; font-size: 12px; margin-top: 8px;")
+        layout.addWidget(stt_sep)
+
+        stt_tip = QLabel(
+            "语音按钮需要 OpenAI 兼容的语音识别 API。\n"
+            "支持 OpenAI / Groq / 硅基流动等，也可在 .env 中配置：\n"
+            "STT_API_KEY / STT_BASE_URL / STT_MODEL"
+        )
+        stt_tip.setWordWrap(True)
+        stt_tip.setStyleSheet("color: #8a6a73; font-size: 12px;")
+        layout.addWidget(stt_tip)
+
+        self.stt_key_edit = QLineEdit()
+        self.stt_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.stt_key_edit.setText(self.settings.get("stt_api_key", ""))
+        self.stt_key_edit.setPlaceholderText("语音识别 API Key（留空则使用 .env）")
+        layout.addWidget(self.stt_key_edit)
+
+        self.stt_url_edit = QLineEdit()
+        self.stt_url_edit.setText(self.settings.get("stt_base_url", ""))
+        self.stt_url_edit.setPlaceholderText(
+            "API 地址，如 %s（留空则使用 .env）" % DEFAULT_STT_BASE_URL
+        )
+        layout.addWidget(self.stt_url_edit)
+
         btn_row = QHBoxLayout()
         reset_btn = QPushButton("恢复默认人设")
         reset_btn.clicked.connect(self._reset)
@@ -91,6 +121,11 @@ class SettingsDialog(QDialog):
         prompt_changed = new_prompt != old_prompt
         self.settings.set("system_prompt", new_prompt)
         self.settings.set("playlist_url", new_url)
+
+        self.settings.set("stt_api_key", self.stt_key_edit.text().strip())
+        stt_url = self.stt_url_edit.text().strip()
+        self.settings.set("stt_base_url", stt_url)
+
         if self.on_saved:
             self.on_saved(prompt_changed)
         self.accept()

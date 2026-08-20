@@ -20,6 +20,15 @@ class Settings:
         self.data.setdefault("pos_x", None)
         self.data.setdefault("pos_y", None)
         self.data.setdefault("playlist_url", DEFAULT_PLAYLIST_URL)
+        self.data.setdefault("stt_api_key", "")
+        self.data.setdefault("stt_base_url", "")
+        self.data.setdefault("stt_model", "")
+        self.data.setdefault("stt_language", "")
+        # 迁移：清除旧版本写入的 OpenAI 默认值，让 .env 生效
+        if self.data.get("stt_base_url") == "https://api.openai.com/v1":
+            self.data["stt_base_url"] = ""
+        if self.data.get("stt_model") == "whisper-1":
+            self.data["stt_model"] = ""
 
     def get(self, key, default=None):
         return self.data.get(key, default)

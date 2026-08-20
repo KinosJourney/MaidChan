@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..config.constants import TYPE_SPEED_MS
+from .macos_window import show_on_all_spaces
 
 
 class SpeechBubble(QWidget):
@@ -85,6 +86,10 @@ class SpeechBubble(QWidget):
         self.is_last_sentence = False
 
         self.hide()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        show_on_all_spaces(self)
 
     # ---- 对外接口 ----
     def speak(self, sentences):

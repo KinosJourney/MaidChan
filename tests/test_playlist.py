@@ -15,17 +15,26 @@ from maidchan.playlist.bilibili import (
 from maidchan.playlist.hotkey import hotkey_display, parse_hotkey
 
 
-SAMPLE_URL = (
+SAMPLE_URL_OLD = (
     "https://space.bilibili.com/599873511/channel/collectiondetail"
     "?sid=6665575&spm_id_from=333.788.0.0"
 )
 
+SAMPLE_URL_NEW = (
+    "https://space.bilibili.com/599873511/lists/4747084?type=season"
+)
+
 
 class ParseCollectionUrlTest(unittest.TestCase):
-    def test_standard_url_with_tracking(self):
-        mid, sid = parse_collection_url(SAMPLE_URL)
+    def test_old_format_with_tracking(self):
+        mid, sid = parse_collection_url(SAMPLE_URL_OLD)
         self.assertEqual(mid, "599873511")
         self.assertEqual(sid, "6665575")
+
+    def test_new_lists_format(self):
+        mid, sid = parse_collection_url(SAMPLE_URL_NEW)
+        self.assertEqual(mid, "599873511")
+        self.assertEqual(sid, "4747084")
 
     def test_rejects_video_url(self):
         with self.assertRaises(CollectionError):

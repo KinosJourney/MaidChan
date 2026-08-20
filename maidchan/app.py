@@ -9,11 +9,13 @@ from PySide6.QtWidgets import QApplication
 
 from .config.paths import APP_ICON
 from .ui.maid_pet import MaidPet
+from .ui.macos_window import use_accessory_activation_policy
 
 
 def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
     app = QApplication(sys.argv)
+    use_accessory_activation_policy()
     app.setWindowIcon(QIcon(APP_ICON))
     app.setQuitOnLastWindowClosed(True)
 

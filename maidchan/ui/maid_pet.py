@@ -10,19 +10,23 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QPoint
+from PySide6.QtCore import Qt, QPoint, QSize, QEvent
 from PySide6.QtGui import (
     QPixmap,
     QPainter,
     QColor,
     QAction,
     QGuiApplication,
+    QIcon,
+    QPen,
+    QTextCursor,
+    QTextOption,
 )
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
     QLabel,
-    QLineEdit,
+    QTextEdit,
     QPushButton,
     QVBoxLayout,
     QHBoxLayout,
@@ -30,16 +34,24 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
+from ..audio import AudioRecorder, SpeechRecognizeWorker, get_stt_env_config
 from ..config.constants import (
     CHARACTER_HEIGHT,
     DEFAULT_PLAYLIST_HOTKEY,
     DEFAULT_PLAYLIST_URL,
+    DEFAULT_STT_BASE_URL,
+    DEFAULT_STT_LANGUAGE,
+    DEFAULT_STT_MODEL,
     DEFAULT_SYSTEM_PROMPT,
     MAX_CONTEXT_TURNS,
+    MAX_MEMORY_INJECT,
+    MAX_RECORDING_SECONDS,
 )
-from ..config.paths import HISTORY_PATH, IMG_BLINK, IMG_OPEN, IMG_ORIGIN
+from ..config.paths import DATA_DIR, HISTORY_PATH, MEMORY_PATH, MEMORY_BACKUP_DIR, IMG_BLINK, IMG_OPEN, IMG_ORIGIN
 from ..core import CharacterStateMachine, NotificationManager, Scheduler
 from ..llm.client import ChatWorker
+from ..llm.memory_extractor import MemoryExtractWorker
+from ..llm.memory_retriever import retrieve_memories_sync
 from ..llm.messages import build_chat_messages
 from ..playlist import (
     GlobalHotkey,
@@ -49,11 +61,13 @@ from ..playlist import (
     short_title,
 )
 from ..storage.history import HistoryStore
+from ..storage.memory import MemoryStore
 from ..storage.profile import Profile
 from ..storage.pomodoro_stats import PomodoroStats
 from ..storage.settings import Settings
-from .dialogs import HelpDialog, HistoryDialog, PomodoroDialog, ProfileDialog, SettingsDialog
+from .dialogs import HelpDialog, HistoryDialog, MemoryDialog, PomodoroDialog, ProfileDialog, SettingsDialog
 from .image_loader import pixmap_from_image_dewhite
+from .macos_window import show_on_all_spaces
 from .speech_bubble import SpeechBubble
 from .text_utils import split_sentences
 
@@ -65,8 +79,16 @@ class MaidPet(QWidget):
         self.settings = Settings()
         self.profile = Profile()
         self.history = HistoryStore(HISTORY_PATH)
+        self.memory = MemoryStore(MEMORY_PATH)
+        self.memory.cleanup_expired()
+        self.memory.auto_backup(MEMORY_BACKUP_DIR)
 
         self.system_prompt = self.settings.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+
+        # 记忆系统状态
+        self._last_user_msg = ""
+        self._current_memories = []
+        self._memory_extract_worker = None
 
         # macOS 上 Qt.Tool 会随应用失去焦点而隐藏，因此使用普通无边框窗口。
         flags = Qt.FramelessWindowHint
@@ -95,31 +117,53 @@ class MaidPet(QWidget):
         self.char_label.setPixmap(self.pix_origin)
         self.char_label.setFixedSize(self.pix_origin.size())
 
-        # 输入区
-        self.input_edit = QLineEdit(self)
-        self.input_edit.setPlaceholderText("和 Maid 说点什么…（回车发送）")
-        self.input_edit.returnPressed.connect(self.on_send)
+        # 输入区：可自动增高的多行输入；空内容显示麦克风，有文字显示向上箭头。
+        self._input_min_h = 36
+        self._input_max_h = 260
+        self.input_edit = QTextEdit(self)
+        self.input_edit.setAcceptRichText(False)
+        self.input_edit.setPlaceholderText("和 Maid 说点什么…（回车发送，Shift+回车换行）")
+        self.input_edit.setFixedHeight(self._input_min_h)
+        self.input_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.input_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.input_edit.setTabChangesFocus(True)
+        # 中文语音结果通常没有空格，必须允许任意位置换行。
+        self.input_edit.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        self.input_edit.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.input_edit.textChanged.connect(self._on_input_changed)
+        self.input_edit.installEventFilter(self)
         self.input_edit.setStyleSheet(
-            "QLineEdit {"
+            "QTextEdit {"
             "  background: rgba(255,255,255,0.92);"
             "  border: 2px solid #ffb7c5;"
             "  border-radius: 14px;"
-            "  padding: 6px 12px;"
+            "  padding: 6px 10px;"
             "  color: #3a2b35;"
             "  font-size: 13px;"
             "}"
         )
-        self.send_btn = QPushButton("发送", self)
-        self.send_btn.clicked.connect(self.on_send)
-        self.send_btn.setCursor(Qt.PointingHandCursor)
-        self.send_btn.setStyleSheet(
-            "QPushButton {"
-            "  background: #ffb7c5; color: white; border: none;"
-            "  border-radius: 14px; padding: 6px 16px; font-size: 13px;"
+
+        self.voice_bar = QLabel(self)
+        self.voice_bar.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.voice_bar.setMinimumHeight(self._input_min_h)
+        self.voice_bar.hide()
+        self.voice_bar.setStyleSheet(
+            "QLabel {"
+            "  background: rgba(255, 107, 107, 0.14);"
+            "  border: 2px solid #ff8a8a;"
+            "  border-radius: 14px;"
+            "  padding: 6px 12px;"
+            "  color: #a33a3a;"
+            "  font-size: 13px;"
             "}"
-            "QPushButton:hover { background: #ff9db0; }"
-            "QPushButton:disabled { background: #e0c3ca; }"
         )
+
+        self.action_btn = QPushButton(self)
+        self.action_btn.setFixedSize(34, 34)
+        self.action_btn.setCursor(Qt.PointingHandCursor)
+        self.action_btn.clicked.connect(self._on_action_clicked)
+        self._action_busy = False
+        self._mic_available = True
 
         # 布局
         root = QVBoxLayout(self)
@@ -130,8 +174,10 @@ class MaidPet(QWidget):
         self.input_row = QWidget(self)
         input_layout = QHBoxLayout(self.input_row)
         input_layout.setContentsMargins(4, 0, 4, 4)
+        input_layout.setSpacing(6)
         input_layout.addWidget(self.input_edit, 1)
-        input_layout.addWidget(self.send_btn, 0)
+        input_layout.addWidget(self.voice_bar, 1)
+        input_layout.addWidget(self.action_btn, 0, Qt.AlignBottom)
         root.addWidget(self.input_row)
 
         self.input_row.setVisible(self.settings.get("show_input", True))
@@ -188,6 +234,7 @@ class MaidPet(QWidget):
             on_complete=self._pomodoro_done,
             on_tick=self._pomodoro_tick,
             on_state_change=self._pomodoro_state_changed,
+            on_rest_done=self._pomodoro_rest_done,
             parent=None,
         )
 
@@ -195,6 +242,14 @@ class MaidPet(QWidget):
         self._drag_pos = None
 
         self.worker = None
+
+        # 语音输入
+        self._recorder = AudioRecorder(self)
+        self._recorder.error.connect(self._on_recorder_error)
+        self._stt_worker = None
+        self._recording_start = 0.0
+        self._mic_available = AudioRecorder.is_available()
+        self._refresh_action_btn()
 
         self._playlist_worker = None
         self._last_playlist_bvid = None
@@ -208,6 +263,11 @@ class MaidPet(QWidget):
         # 启动待机动画（眨眼），并在打开时问候
         self.state.start()
         self.scheduler.schedule_once("greet", 800, self.greet)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # setWindowFlags() 可能重建原生窗口，因此每次显示时都重新设置。
+        show_on_all_spaces(self)
 
     # ---- 占位图 ----
     def _placeholder(self):
@@ -240,6 +300,24 @@ class MaidPet(QWidget):
         self.settings.set("pos_x", self.x())
         self.settings.set("pos_y", self.y())
 
+    def _place_dialog_on_screen(self, dialog):
+        """将弹窗放在 Maid 附近，并限制在当前屏幕的可用范围内。"""
+        anchor = QPoint(
+            self.x() + self.width() // 2,
+            self.y() + self.height() // 2,
+        )
+        screen = QGuiApplication.screenAt(anchor) or QGuiApplication.primaryScreen()
+        area = screen.availableGeometry()
+
+        x = anchor.x() - dialog.width() // 2
+        y = anchor.y() - dialog.height() // 2
+        max_x = max(area.left(), area.right() - dialog.width() + 1)
+        max_y = max(area.top(), area.bottom() - dialog.height() + 1)
+        dialog.move(
+            max(area.left(), min(x, max_x)),
+            max(area.top(), min(y, max_y)),
+        )
+
     # ---- 气泡定位 ----
     def _position_bubble(self):
         gx = self.x() + self.width() // 2 - self.bubble.width() // 2
@@ -255,24 +333,28 @@ class MaidPet(QWidget):
 
     # ===================== 对话流程 =====================
     def on_send(self):
-        text = self.input_edit.text().strip()
+        text = self.input_edit.toPlainText().strip()
         if not text:
             return
         if self.worker and self.worker.isRunning():
             self.show_local("稍等，我还在想上一句呢～")
             return
         self.input_edit.clear()
+        self._adjust_input_height()
         self.last_active = time.time()
         self._idle_greeted = False
 
         # 记录用户消息
+        self._last_user_msg = text
         self.history.add("user", text)
+
+        # 从长期记忆中检索与当前消息相关的记忆
+        self._current_memories = self._retrieve_relevant_memories(text)
 
         # 构建发给 API 的 messages
         messages = self._build_messages()
 
-        self.send_btn.setEnabled(False)
-        self.send_btn.setText("思考中…")
+        self._set_action_busy(True)
         self.state.begin_thinking()
 
         self.worker = ChatWorker(messages, self)
@@ -280,24 +362,81 @@ class MaidPet(QWidget):
         self.worker.failed.connect(self._on_reply_failed)
         self.worker.start()
 
+    def _retrieve_relevant_memories(self, user_msg):
+        """同步检索相关记忆：用简单关键词匹配，不额外调 API。"""
+        words = [w for w in user_msg if len(w.strip()) > 0]
+        keywords = []
+        for segment in user_msg.replace("，", " ").replace("。", " ").replace(
+            "！", " ").replace("？", " ").replace("、", " ").split():
+            if len(segment) >= 2:
+                keywords.append(segment)
+        return retrieve_memories_sync(self.memory, keywords, limit=MAX_MEMORY_INJECT)
+
     def _build_messages(self):
         return build_chat_messages(
             system_prompt=self.system_prompt,
             profile=self.profile,
             history=self.history,
+            memories=self._current_memories,
             max_context_turns=MAX_CONTEXT_TURNS,
         )
 
     def _on_reply(self, content):
-        self.send_btn.setEnabled(True)
-        self.send_btn.setText("发送")
+        self._set_action_busy(False)
         self.history.add("maid", content)
         self.say(content)
+        # 标记被召回的记忆
+        for m in self._current_memories:
+            self.memory.mark_recalled(m.get("id"))
+        # 后台提取新记忆
+        self._extract_memory(self._last_user_msg, content)
 
     def _on_reply_failed(self, err):
-        self.send_btn.setEnabled(True)
-        self.send_btn.setText("发送")
+        self._set_action_busy(False)
         self.say(err)
+
+    # ===================== 记忆提取 =====================
+    def _extract_memory(self, user_msg, assistant_msg):
+        """在后台线程中让模型判断本轮是否值得记忆。"""
+        if self._memory_extract_worker and self._memory_extract_worker.isRunning():
+            return
+        self._memory_extract_worker = MemoryExtractWorker(user_msg, assistant_msg, self)
+        self._memory_extract_worker.extracted.connect(self._on_memories_extracted)
+        self._memory_extract_worker.failed.connect(self._on_memory_extract_failed)
+        self._memory_extract_worker.start()
+
+    def _on_memories_extracted(self, memories):
+        """收到提取结果后，存入长期记忆库。"""
+        changed = False
+        for mem in memories:
+            content = mem.get("content", "").strip()
+            mem_type = mem.get("type", "profile")
+            if not content:
+                continue
+            # 去重：如果已有相似记忆，更新而非新增
+            is_dup, existing = self.memory.deduplicate(content, mem_type)
+            if is_dup and existing:
+                if len(content) > len(existing.get("content", "")):
+                    self.memory.update_content(
+                        existing["id"], content, mem.get("tags")
+                    )
+                    changed = True
+            else:
+                self.memory.add(
+                    memory_type=mem_type,
+                    content=content,
+                    tags=mem.get("tags", []),
+                    importance=mem.get("importance", 0.5),
+                    confidence=0.9,
+                    source_ids=[self.history.last_message_id or ""],
+                )
+                changed = True
+        # 如果记忆面板正在打开，实时刷新
+        if changed and hasattr(self, '_memory_dialog') and self._memory_dialog is not None:
+            self._memory_dialog.refresh()
+
+    def _on_memory_extract_failed(self, err):
+        pass  # 记忆提取失败不影响正常使用
 
     # ---- 本地说话（不走 API，不记历史） ----
     def show_local(self, text):
@@ -309,6 +448,7 @@ class MaidPet(QWidget):
 
     # ===================== 空闲 / 问候 =====================
     def greet(self):
+        """启动时的简单本地问候（不走 API）。"""
         hour = datetime.now().hour
         name = self.profile.get("call_me") or self.profile.get("nickname") or "主人"
         if 5 <= hour < 11:
@@ -323,6 +463,56 @@ class MaidPet(QWidget):
             msg = "这么晚还不睡吗，%s？早点休息对身体好哦。" % name
         self.show_local(msg)
 
+    def start_new_topic(self):
+        """通过 LLM 让 Maid 主动开启一个新话题。"""
+        if self.worker and self.worker.isRunning():
+            self.show_local("稍等，我还在想上一句呢～")
+            return
+
+        self.last_active = time.time()
+        self._idle_greeted = False
+
+        recent_memories = self.memory.get_recent_important(limit=MAX_MEMORY_INJECT)
+
+        messages = build_chat_messages(
+            system_prompt=self.system_prompt,
+            profile=self.profile,
+            history=self.history,
+            memories=recent_memories,
+            max_context_turns=MAX_CONTEXT_TURNS,
+        )
+
+        hour = datetime.now().hour
+        name = self.profile.get("call_me") or self.profile.get("nickname") or "主人"
+        messages.append({
+            "role": "user",
+            "content": (
+                "[系统指令，非用户发言] 现在请你主动开启一个新话题和%s聊天。"
+                "可以根据你对%s的了解（记忆中的信息）、当前时间（%d 点）、"
+                "或是你自己感兴趣的话题来发起对话。"
+                "要自然随意，就像朋友突然想找人聊天一样，"
+                "不要说「有什么可以帮你的」之类的客服话术，"
+                "也不要重复之前说过的话。"
+            ) % (name, name, hour),
+        })
+
+        self._set_action_busy(True)
+        self.state.begin_thinking()
+
+        self.worker = ChatWorker(messages, self)
+        self.worker.finished_ok.connect(self._on_topic_reply)
+        self.worker.failed.connect(self._on_topic_failed)
+        self.worker.start()
+
+    def _on_topic_reply(self, content):
+        self._set_action_busy(False)
+        self.history.add("maid", content)
+        self.say(content)
+
+    def _on_topic_failed(self, err):
+        self._set_action_busy(False)
+        self.greet()
+
     def _check_idle(self):
         idle = time.time() - self.last_active
         if idle > 600 and not self._idle_greeted and not self.state.is_speaking:
@@ -335,8 +525,301 @@ class MaidPet(QWidget):
             ]
             self.show_local(random.choice(tips))
 
+    # ===================== 输入区操作按钮 / 语音输入 =====================
+    def eventFilter(self, obj, event):
+        if obj is self.input_edit and event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                if event.modifiers() & Qt.ShiftModifier:
+                    return False
+                self.on_send()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _on_input_changed(self):
+        self._adjust_input_height()
+        self._refresh_action_btn()
+
+    def _adjust_input_height(self):
+        """按内容自动增高输入框，超出上限后出现滚动条。"""
+        edit = self.input_edit
+        doc = edit.document()
+
+        avail_w = edit.viewport().width()
+        if avail_w < 40:
+            avail_w = max(40, self.input_row.width() - self.action_btn.width() - 40)
+        avail_w = max(40, avail_w)
+        doc.setTextWidth(avail_w)
+
+        # QTextEdit 会完整排版文档，size().height() 即内容高度
+        doc_h = doc.size().height()
+        chrome = edit.height() - edit.viewport().height()
+        if chrome < 12:
+            chrome = 20  # 边框 + padding 兜底
+        target = int(doc_h + chrome + 4)
+
+        # 再用字数估算兜底，避免偶发排版高度偏小
+        text = edit.toPlainText()
+        if text:
+            fm = edit.fontMetrics()
+            char_w = max(1, fm.horizontalAdvance("汉"))
+            chars_per_line = max(1, avail_w // char_w)
+            est_lines = 0
+            for paragraph in text.split("\n"):
+                if paragraph == "":
+                    est_lines += 1
+                else:
+                    est_lines += max(1, (len(paragraph) + chars_per_line - 1) // chars_per_line)
+            est_h = int(est_lines * fm.lineSpacing() + chrome)
+            target = max(target, est_h)
+
+        target = max(self._input_min_h, min(target, self._input_max_h))
+        if edit.height() != target:
+            edit.setFixedHeight(target)
+            edit.updateGeometry()
+            self.input_row.adjustSize()
+            self.adjustSize()
+        if target >= self._input_max_h:
+            edit.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        else:
+            edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+    def _input_text(self):
+        return self.input_edit.toPlainText().strip()
+
+    def _on_action_clicked(self):
+        if self._action_busy:
+            return
+        if self._recorder.is_recording:
+            self._stop_recording()
+            return
+        if self._stt_worker and self._stt_worker.isRunning():
+            return
+        if self._input_text():
+            self.on_send()
+            return
+        self._start_recording()
+
+    def _set_action_busy(self, busy):
+        self._action_busy = busy
+        self._refresh_action_btn()
+
+    def _refresh_action_btn(self):
+        """根据当前状态切换圆形按钮：麦克风 / 向上箭头 / 停止 / 忙碌。"""
+        recording = self._recorder.is_recording
+        recognizing = bool(self._stt_worker and self._stt_worker.isRunning())
+        has_text = bool(self._input_text())
+
+        if self._action_busy:
+            self._set_action_icon("busy", "#ffffff")
+            self.action_btn.setEnabled(False)
+            self.action_btn.setToolTip("思考中…")
+            self.action_btn.setStyleSheet(self._action_style("#e0c3ca"))
+            return
+
+        if recording:
+            self._set_action_icon("stop", "#ffffff")
+            self.action_btn.setEnabled(True)
+            self.action_btn.setToolTip("点击停止录音")
+            self.action_btn.setStyleSheet(self._action_style("#ff6b6b", hover="#ff4a4a"))
+            return
+
+        if recognizing:
+            self._set_action_icon("busy", "#ffffff")
+            self.action_btn.setEnabled(False)
+            self.action_btn.setToolTip("正在识别语音…")
+            self.action_btn.setStyleSheet(self._action_style("#e0c3ca"))
+            return
+
+        if has_text:
+            self._set_action_icon("send", "#ffffff")
+            self.action_btn.setEnabled(True)
+            self.action_btn.setToolTip("发送")
+            self.action_btn.setStyleSheet(self._action_style("#ffb7c5", hover="#ff9db0"))
+            return
+
+        mic_ok = getattr(self, "_mic_available", True)
+        self.action_btn.setEnabled(mic_ok)
+        if mic_ok:
+            self._set_action_icon("mic", "#ffffff")
+            self.action_btn.setToolTip("点击开始语音输入，再次点击停止")
+            self.action_btn.setStyleSheet(self._action_style("#ffb7c5", hover="#ff9db0"))
+        else:
+            self._set_action_icon("mic", "#b0a4a8")
+            self.action_btn.setToolTip("语音输入不可用（缺少麦克风或 QtMultimedia）")
+            self.action_btn.setStyleSheet(self._action_style("#e8e0e4"))
+
+    def _set_action_icon(self, kind, color):
+        self.action_btn.setText("")
+        self.action_btn.setIcon(self._make_action_icon(kind, QColor(color)))
+        side = max(16, int(self.action_btn.width() * 0.55))
+        self.action_btn.setIconSize(QSize(side, side))
+
+    @staticmethod
+    def _make_action_icon(kind, color):
+        size = 64
+        pm = QPixmap(size, size)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(color, 5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(color)
+
+        if kind == "send":
+            # 向上箭头
+            p.drawLine(32, 50, 32, 16)
+            p.drawLine(32, 16, 18, 30)
+            p.drawLine(32, 16, 46, 30)
+        elif kind == "mic":
+            # 实心胶囊麦克风 + 底座弧线
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(24, 10, 16, 28, 8, 8)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawArc(16, 24, 32, 26, 0, -180 * 16)
+            p.drawLine(32, 50, 32, 56)
+            p.drawLine(22, 56, 42, 56)
+        elif kind == "stop":
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(20, 20, 24, 24, 4, 4)
+        else:  # busy
+            p.setPen(Qt.NoPen)
+            for i, x in enumerate((18, 32, 46)):
+                p.setOpacity(0.45 + i * 0.25)
+                p.drawEllipse(x - 4, 28, 8, 8)
+        p.end()
+        return QIcon(pm)
+
+    @staticmethod
+    def _action_style(bg, hover=None):
+        hover = hover or bg
+        return (
+            "QPushButton {"
+            "  background: %s; color: white; border: none;"
+            "  border-radius: 17px; padding: 0px;"
+            "}"
+            "QPushButton:hover { background: %s; }"
+            "QPushButton:disabled { background: #e8e0e4; }"
+        ) % (bg, hover)
+
+    def _show_voice_bar(self, text="正在听…"):
+        self.input_edit.hide()
+        self.voice_bar.setText(text)
+        self.voice_bar.show()
+
+    def _hide_voice_bar(self):
+        self.voice_bar.hide()
+        self.input_edit.show()
+
+    def _start_recording(self):
+        if not getattr(self, "_mic_available", True):
+            return
+        if self._stt_worker and self._stt_worker.isRunning():
+            self.show_local("语音正在识别中，请稍等～")
+            return
+        if self._recorder.start():
+            self._recording_start = time.time()
+            self._audio_levels = []
+            self._show_voice_bar("正在听…  0s")
+            self._refresh_action_btn()
+            self.scheduler.schedule_repeating(
+                "mic_display", 150, self._update_mic_display,
+            )
+            self.scheduler.schedule_once(
+                "mic_timeout", MAX_RECORDING_SECONDS * 1000,
+                self._auto_stop_recording,
+            )
+
+    def _update_mic_display(self):
+        elapsed = int(time.time() - self._recording_start)
+        peak = self._recorder.peak_level()
+        self._audio_levels.append(peak)
+        if len(self._audio_levels) > 10:
+            self._audio_levels = self._audio_levels[-10:]
+        bars = "".join(self._level_char(lv) for lv in self._audio_levels)
+        self.voice_bar.setText("正在听…  %ds  %s" % (elapsed, bars))
+
+    @staticmethod
+    def _level_char(level):
+        chars = "▁▂▃▄▅▆▇█"
+        idx = min(int(level * len(chars)), len(chars) - 1)
+        return chars[idx]
+
+    def _stop_recording(self):
+        self.scheduler.cancel("mic_timeout")
+        self.scheduler.cancel("mic_display")
+        duration = time.time() - self._recording_start
+        wav_data = self._recorder.stop()
+
+        if duration < 0.5 or len(wav_data) < 5000:
+            self.show_local("录音太短了，请说长一点～")
+            self._reset_voice_ui()
+            return
+
+        self._save_debug_wav(wav_data)
+        self._send_to_stt(wav_data)
+
+    def _auto_stop_recording(self):
+        if self._recorder.is_recording:
+            self.show_local("录音已达最大时长，自动停止。")
+            self._stop_recording()
+
+    def _save_debug_wav(self, wav_data):
+        try:
+            path = os.path.join(DATA_DIR, "last_recording.wav")
+            with open(path, "wb") as f:
+                f.write(wav_data)
+        except OSError:
+            pass
+
+    def _send_to_stt(self, wav_data):
+        self._show_voice_bar("识别中…")
+
+        env_key, env_url, env_model = get_stt_env_config()
+        base_url = self.settings.get("stt_base_url", "") or env_url or DEFAULT_STT_BASE_URL
+        api_key = self.settings.get("stt_api_key", "") or env_key
+        model = self.settings.get("stt_model", "") or env_model or DEFAULT_STT_MODEL
+        language = self.settings.get("stt_language", DEFAULT_STT_LANGUAGE)
+
+        self._stt_worker = SpeechRecognizeWorker(
+            wav_data, base_url, api_key, model, language, self,
+        )
+        self._stt_worker.finished_ok.connect(self._on_stt_result)
+        self._stt_worker.failed.connect(self._on_stt_failed)
+        self._stt_worker.start()
+        self._refresh_action_btn()
+
+    def _on_stt_result(self, text):
+        self._hide_voice_bar()
+        self.input_edit.setPlainText(text)
+        self.input_edit.moveCursor(QTextCursor.End)
+        self.input_edit.setFocus()
+        # 布局稳定后再算一次高度，避免刚显示时宽度不准
+        self._adjust_input_height()
+        self.scheduler.schedule_once("input_height", 50, self._adjust_input_height)
+        self._reset_voice_ui()
+
+    def _on_stt_failed(self, err):
+        debug_path = os.path.join(DATA_DIR, "last_recording.wav")
+        if os.path.isfile(debug_path):
+            size_kb = os.path.getsize(debug_path) // 1024
+            self.show_local("%s（录音 %dKB 已保存到 MaidChan 目录）" % (err, size_kb))
+        else:
+            self.show_local(err)
+        self._reset_voice_ui()
+
+    def _on_recorder_error(self, err):
+        self.show_local(err)
+        self._reset_voice_ui()
+
+    def _reset_voice_ui(self):
+        self._hide_voice_bar()
+        self._refresh_action_btn()
+
     # ===================== 番茄钟 =====================
     def open_pomodoro(self):
+        self._place_dialog_on_screen(self._pomodoro_dialog)
         self._pomodoro_dialog.show_and_raise()
 
     def _pomodoro_tick(self, time_text):
@@ -360,6 +843,10 @@ class MaidPet(QWidget):
         self.show_local(
             "时间到啦，%s！休息一下吧～今天已经完成 %d 个番茄了，真棒！" % (name, count)
         )
+
+    def _pomodoro_rest_done(self):
+        name = self.profile.get("call_me") or "主人"
+        self.show_local("休息结束啦，%s！我们继续加油吧～" % name)
 
     # ===================== 合集随机播放 =====================
     def _setup_playlist_shortcut(self):
@@ -430,6 +917,10 @@ class MaidPet(QWidget):
         act_history.triggered.connect(self.open_history)
         menu.addAction(act_history)
 
+        act_memory = QAction("长期记忆（%d 条）…" % self.memory.enabled_count, self)
+        act_memory.triggered.connect(self.open_memory)
+        menu.addAction(act_memory)
+
         act_settings = QAction("设置 · 人设…", self)
         act_settings.triggered.connect(self.open_settings)
         menu.addAction(act_settings)
@@ -445,7 +936,7 @@ class MaidPet(QWidget):
         menu.addSeparator()
 
         act_greet = QAction("和我打个招呼", self)
-        act_greet.triggered.connect(self.greet)
+        act_greet.triggered.connect(self.start_new_topic)
         menu.addAction(act_greet)
 
         pomo_text = "番茄钟（进行中…）" if self._pomodoro_dialog.is_running else "番茄钟…"
@@ -491,10 +982,25 @@ class MaidPet(QWidget):
 
     def open_history(self):
         dlg = HistoryDialog(self.history, on_changed=lambda: None, parent=self)
+        self._place_dialog_on_screen(dlg)
         dlg.exec()
+
+    def open_memory(self):
+        if hasattr(self, '_memory_dialog') and self._memory_dialog is not None:
+            self._memory_dialog.refresh()
+            self._place_dialog_on_screen(self._memory_dialog)
+            self._memory_dialog.raise_()
+            self._memory_dialog.activateWindow()
+            return
+        self._memory_dialog = MemoryDialog(self.memory, parent=None)
+        self._memory_dialog.setAttribute(Qt.WA_DeleteOnClose)
+        self._memory_dialog.destroyed.connect(lambda: setattr(self, '_memory_dialog', None))
+        self._place_dialog_on_screen(self._memory_dialog)
+        self._memory_dialog.show()
 
     def open_settings(self):
         dlg = SettingsDialog(self.settings, on_saved=self._on_settings_saved, parent=self)
+        self._place_dialog_on_screen(dlg)
         dlg.exec()
 
     def _on_settings_saved(self, prompt_changed=True):
@@ -508,6 +1014,7 @@ class MaidPet(QWidget):
 
     def open_profile(self):
         dlg = ProfileDialog(self.profile, on_saved=self._on_profile_saved, parent=self)
+        self._place_dialog_on_screen(dlg)
         dlg.exec()
 
     def _on_profile_saved(self):
@@ -516,6 +1023,7 @@ class MaidPet(QWidget):
 
     def open_help(self):
         dlg = HelpDialog(parent=self)
+        self._place_dialog_on_screen(dlg)
         dlg.exec()
 
     def toggle_on_top(self):
@@ -608,11 +1116,13 @@ class MaidPet(QWidget):
 
     def clear_memory(self):
         ret = QMessageBox.question(
-            self, "确认", "确定要清空全部聊天记忆吗？角色会忘记之前的对话。"
+            self, "确认",
+            "确定要清空全部记忆吗？这将清除聊天历史和长期记忆，角色会完全忘记你。"
         )
         if ret == QMessageBox.Yes:
             self.history.clear()
-            self.show_local("好的，我已经把之前的对话都忘掉了～")
+            self.memory.clear()
+            self.show_local("好的，我已经把所有关于你的记忆都忘掉了～")
 
     def quit_app(self):
         self._save_position()
@@ -622,12 +1132,16 @@ class MaidPet(QWidget):
     def _teardown(self):
         """统一清理：停止全部定时任务、等待后台请求结束、关闭气泡。"""
         self.scheduler.shutdown()
+        if self._recorder.is_recording:
+            self._recorder.cancel()
         if self._global_hotkey is not None:
             self._global_hotkey.unregister()
         if self._playlist_worker is not None and self._playlist_worker.isRunning():
             self._playlist_worker.wait(2000)
         if self.worker is not None and self.worker.isRunning():
             self.worker.wait(3000)
+        if self._stt_worker is not None and self._stt_worker.isRunning():
+            self._stt_worker.wait(3000)
         self._pomodoro_dialog.close()
         self.bubble.close()
 

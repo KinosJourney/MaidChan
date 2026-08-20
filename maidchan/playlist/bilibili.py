@@ -38,8 +38,9 @@ class CollectionError(Exception):
 def parse_collection_url(url):
     """从合集页 URL 解析 (mid, season_id)。
 
-    支持：
+    支持两种格式：
     ``https://space.bilibili.com/{mid}/channel/collectiondetail?sid={sid}``
+    ``https://space.bilibili.com/{mid}/lists/{sid}?type=season``
     """
     if not url or not str(url).strip():
         raise CollectionError("还没有填写合集链接哦～")
@@ -50,15 +51,21 @@ def parse_collection_url(url):
     if "bilibili.com" not in host:
         raise CollectionError("目前只支持 B 站合集链接。")
 
-    qs = parse_qs(parsed.query)
-    sid = (qs.get("sid") or [None])[0]
     path_parts = [p for p in parsed.path.strip("/").split("/") if p]
     mid = path_parts[0] if path_parts else None
+
+    sid = None
+    if len(path_parts) >= 3 and path_parts[1] == "lists":
+        sid = path_parts[2]
+    else:
+        qs = parse_qs(parsed.query)
+        sid = (qs.get("sid") or [None])[0]
 
     if not (mid and mid.isdigit() and sid and str(sid).isdigit()):
         raise CollectionError(
             "没认出这是合集链接。请使用类似\n"
-            "space.bilibili.com/数字/channel/collectiondetail?sid=数字"
+            "space.bilibili.com/数字/lists/数字?type=season\n"
+            "或 space.bilibili.com/数字/channel/collectiondetail?sid=数字"
         )
     return mid, str(sid)
 

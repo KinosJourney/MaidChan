@@ -11,6 +11,7 @@ import unittest
 
 from maidchan.storage.json_io import load_json, save_json
 from maidchan.storage.history import HistoryStore
+from maidchan.storage.memory import MemoryStore
 from maidchan.storage.pomodoro_stats import PomodoroStats
 from maidchan.storage.profile import Profile
 from maidchan.llm.messages import build_chat_messages
@@ -199,6 +200,97 @@ class PomodoroStatsTest(TempDirTestCase):
         save_json(path, {"date": date.today().isoformat(), "count": -5})
         s = PomodoroStats(path)
         self.assertEqual(s.today_count, 0)
+
+
+class MemoryStoreTest(TempDirTestCase):
+    def _store(self):
+        return MemoryStore(os.path.join(self.tmp, "memories.json"))
+
+    def test_add_and_retrieve(self):
+        m = self._store()
+        m.add("preference", "用户喜欢吃辣", tags=["饮食", "辣味"], importance=0.6)
+        self.assertEqual(m.count, 1)
+        self.assertEqual(m.items[0]["content"], "用户喜欢吃辣")
+        self.assertEqual(m.items[0]["type"], "preference")
+
+    def test_delete(self):
+        m = self._store()
+        item = m.add("profile", "用户是程序员")
+        self.assertTrue(m.delete(item["id"]))
+        self.assertEqual(m.count, 0)
+
+    def test_search_by_keywords(self):
+        m = self._store()
+        m.add("preference", "用户喜欢吃火鸡面", tags=["饮食", "辣味"])
+        m.add("preference", "用户讨厌香菜", tags=["饮食"])
+        m.add("episode", "用户昨天加班到很晚", tags=["工作"])
+        results = m.search_by_keywords(["火鸡面", "辣"])
+        self.assertTrue(len(results) >= 1)
+        self.assertIn("火鸡面", results[0]["content"])
+
+    def test_search_by_tags(self):
+        m = self._store()
+        m.add("preference", "用户喜欢喝奶茶", tags=["饮食", "甜品"])
+        m.add("goal", "用户想减肥", tags=["健康", "目标"])
+        results = m.search_by_tags(["饮食"])
+        self.assertEqual(len(results), 1)
+        self.assertIn("奶茶", results[0]["content"])
+
+    def test_deduplicate(self):
+        m = self._store()
+        m.add("preference", "用户喜欢吃辣")
+        is_dup, existing = m.deduplicate("用户喜欢吃辣", "preference")
+        self.assertTrue(is_dup)
+        self.assertIsNotNone(existing)
+        is_dup2, _ = m.deduplicate("用户喜欢游泳", "preference")
+        self.assertFalse(is_dup2)
+
+    def test_clear(self):
+        m = self._store()
+        m.add("profile", "A")
+        m.add("profile", "B")
+        m.clear()
+        self.assertEqual(m.count, 0)
+
+    def test_persistence(self):
+        path = os.path.join(self.tmp, "memories.json")
+        m1 = MemoryStore(path)
+        m1.add("preference", "用户喜欢猫")
+        m2 = MemoryStore(path)
+        self.assertEqual(m2.count, 1)
+        self.assertEqual(m2.items[0]["content"], "用户喜欢猫")
+
+    def test_mark_recalled(self):
+        m = self._store()
+        item = m.add("profile", "用户叫小明")
+        m.mark_recalled(item["id"])
+        self.assertEqual(m.items[0]["recall_count"], 1)
+        self.assertIsNotNone(m.items[0]["last_recalled_at"])
+
+
+class BuildMessagesWithMemoryTest(unittest.TestCase):
+    def test_memories_injected(self):
+        prof = _FakeProfile("")
+        hist = _FakeHistory([{"role": "user", "content": "我想吃火鸡面"}])
+        memories = [
+            {"type": "preference", "content": "用户喜欢吃辣", "created_at": "2026-08-18 22:00:00"},
+        ]
+        msgs = build_chat_messages(
+            system_prompt="你是 Maid",
+            profile=prof,
+            history=hist,
+            memories=memories,
+        )
+        self.assertIn("用户喜欢吃辣", msgs[0]["content"])
+        self.assertIn("不要主动罗列", msgs[0]["content"])
+
+    def test_no_memories_no_injection(self):
+        prof = _FakeProfile("")
+        hist = _FakeHistory([])
+        msgs = build_chat_messages(
+            system_prompt="P", profile=prof, history=hist, memories=None
+        )
+        self.assertEqual(msgs[0]["content"], "P")
 
 
 class SplitSentencesTest(unittest.TestCase):

@@ -3,12 +3,14 @@
 
 from .help_dialog import HelpDialog
 from .history_dialog import HistoryDialog
+from .memory_dialog import MemoryDialog
 from .pomodoro_dialog import PomodoroDialog
 from .profile_dialog import ProfileDialog
 from .settings_dialog import SettingsDialog
 
 __all__ = [
     "HistoryDialog",
+    "MemoryDialog",
     "PomodoroDialog",
     "SettingsDialog",
     "ProfileDialog",
