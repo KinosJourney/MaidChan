@@ -87,6 +87,12 @@ class ParseHotkeyTest(unittest.TestCase):
     def test_display_contains_letter(self):
         self.assertIn("P", hotkey_display("Ctrl+Shift+P"))
 
+    def test_space_key(self):
+        mods, key = parse_hotkey("Ctrl+Shift+Space")
+        self.assertEqual(mods, {"ctrl", "shift"})
+        self.assertEqual(key, "SPACE")
+        self.assertIn("空格", hotkey_display("Ctrl+Shift+Space"))
+
 
 class FakeResp:
     def __init__(self, payload, status=200):

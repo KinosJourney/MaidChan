@@ -10,7 +10,7 @@ import ctypes
 import sys
 import traceback
 
-from PySide6.QtCore import QAbstractNativeEventFilter, QObject, Signal
+from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QTimer, Signal
 from PySide6.QtGui import QKeySequence
 
 # macOS ANSI 字母键码（A-Z）
@@ -41,6 +41,7 @@ _MAC_LETTER_KEYCODES = {
     "K": 0x28,
     "N": 0x2D,
     "M": 0x2E,
+    "SPACE": 0x31,
 }
 
 # Carbon 修饰键（RegisterEventHotKey 用）
@@ -59,7 +60,7 @@ _WM_HOTKEY = 0x0312
 
 
 def parse_hotkey(spec):
-    """把 ``Ctrl+Shift+P`` 解析为 (modifier_set, letter)。
+    """把 ``Ctrl+Shift+P`` 解析为 (modifier_set, key)。
 
     ``Ctrl`` 一律表示物理 Control 键（macOS 上不是 Command）。
     """
@@ -68,9 +69,11 @@ def parse_hotkey(spec):
     parts = [p.strip() for p in str(spec).split("+") if p.strip()]
     if len(parts) < 2:
         raise ValueError("hotkey needs a modifier")
-    letter = parts[-1].upper()
-    if len(letter) != 1 or not letter.isalpha():
-        raise ValueError("hotkey key must be A-Z")
+    key = parts[-1].upper()
+    if key in ("SPACE", "空格"):
+        key = "SPACE"
+    elif len(key) != 1 or not key.isalpha():
+        raise ValueError("hotkey key must be A-Z or Space")
     mods = set()
     for raw in parts[:-1]:
         name = raw.strip().lower()
@@ -86,12 +89,12 @@ def parse_hotkey(spec):
             raise ValueError("unknown modifier: %s" % raw)
     if not mods:
         raise ValueError("hotkey needs a modifier")
-    return mods, letter
+    return mods, key
 
 
 def qt_key_sequence(spec):
     """生成与全局快捷键一致的 QKeySequence（Mac 上 Ctrl=物理 Control）。"""
-    mods, letter = parse_hotkey(spec)
+    mods, key = parse_hotkey(spec)
     tokens = []
     if "ctrl" in mods:
         tokens.append("Meta" if sys.platform == "darwin" else "Ctrl")
@@ -101,13 +104,14 @@ def qt_key_sequence(spec):
         tokens.append("Alt")
     if "meta" in mods:
         tokens.append("Ctrl" if sys.platform == "darwin" else "Meta")
-    tokens.append(letter)
+    tokens.append("Space" if key == "SPACE" else key)
     return QKeySequence("+".join(tokens))
 
 
 def hotkey_display(spec):
     """菜单 / 说明里展示的快捷键文本。"""
-    mods, letter = parse_hotkey(spec)
+    mods, key = parse_hotkey(spec)
+    key_text = "空格" if key == "SPACE" else key
     if sys.platform == "darwin":
         bits = []
         if "ctrl" in mods:
@@ -118,7 +122,7 @@ def hotkey_display(spec):
             bits.append("⇧")
         if "meta" in mods:
             bits.append("⌘")
-        return "".join(bits) + letter
+        return "".join(bits) + key_text
     bits = []
     if "ctrl" in mods:
         bits.append("Ctrl")
@@ -128,7 +132,7 @@ def hotkey_display(spec):
         bits.append("Shift")
     if "meta" in mods:
         bits.append("Win")
-    bits.append(letter)
+    bits.append(key_text)
     return "+".join(bits)
 
 
@@ -154,9 +158,12 @@ class _WinHotkeyFilter(QAbstractNativeEventFilter):
 
 
 class GlobalHotkey(QObject):
-    """系统级快捷键。``activated`` 在主线程发出。"""
+    """系统级快捷键，支持区分按下与松开。"""
 
     activated = Signal()
+    pressed = Signal()
+    released = Signal()
+    _next_id = 1
 
     def __init__(self, spec, widget=None, parent=None):
         super().__init__(parent)
@@ -167,7 +174,14 @@ class GlobalHotkey(QObject):
         self._mac_callback = None
         self._win_filter = None
         self._win_hwnd = None
-        self._win_id = 1
+        self._hotkey_id = GlobalHotkey._next_id
+        GlobalHotkey._next_id += 1
+        self._win_id = self._hotkey_id
+        self._win_vk = None
+        self._win_pressed = False
+        self._win_release_timer = QTimer(self)
+        self._win_release_timer.setInterval(20)
+        self._win_release_timer.timeout.connect(self._poll_win_release)
         self.registered = False
         try:
             self._register()
@@ -181,23 +195,34 @@ class GlobalHotkey(QObject):
             self._unregister_win()
         self.registered = False
 
-    def _fire(self):
+    def _fire_pressed(self):
+        if self._win_pressed:
+            return
+        self._win_pressed = True
+        self.pressed.emit()
         self.activated.emit()
 
+    def _fire_released(self):
+        if not self._win_pressed:
+            return
+        self._win_pressed = False
+        self._win_release_timer.stop()
+        self.released.emit()
+
     def _register(self):
-        mods, letter = parse_hotkey(self._spec)
+        mods, key = parse_hotkey(self._spec)
         if sys.platform == "darwin":
-            self._register_mac(mods, letter)
+            self._register_mac(mods, key)
         elif sys.platform.startswith("win"):
-            self._register_win(mods, letter)
+            self._register_win(mods, key)
 
     # ---- macOS Carbon ----
-    def _register_mac(self, mods, letter):
+    def _register_mac(self, mods, key):
         import ctypes.util
 
-        keycode = _MAC_LETTER_KEYCODES.get(letter)
+        keycode = _MAC_LETTER_KEYCODES.get(key)
         if keycode is None:
-            raise ValueError("unsupported key: %s" % letter)
+            raise ValueError("unsupported key: %s" % key)
         native_mods = 0
         if "ctrl" in mods:
             native_mods |= _MAC_CONTROL
@@ -257,23 +282,56 @@ class GlobalHotkey(QObject):
         carbon.UnregisterEventHotKey.argtypes = [event_ref]
         carbon.RemoveEventHandler.restype = os_status
         carbon.RemoveEventHandler.argtypes = [event_ref]
+        carbon.GetEventKind.restype = ctypes.c_uint32
+        carbon.GetEventKind.argtypes = [event_ref]
+        carbon.GetEventParameter.restype = os_status
+        carbon.GetEventParameter.argtypes = [
+            event_ref,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
 
         def _handler(_next, _event, _user):
-            self._fire()
+            event_id = EventHotKeyID()
+            err = carbon.GetEventParameter(
+                _event,
+                0x2D2D2D2D,  # kEventParamDirectObject ('----')
+                0x686B6964,  # typeEventHotKeyID ('hkid')
+                None,
+                ctypes.sizeof(event_id),
+                None,
+                ctypes.byref(event_id),
+            )
+            if (
+                err != 0
+                or event_id.signature != 0x4D414944
+                or event_id.id != self._hotkey_id
+            ):
+                return -9874  # eventNotHandledErr
+            if carbon.GetEventKind(_event) == 5:
+                self._fire_pressed()
+            else:
+                self._fire_released()
             return 0
 
         self._mac_callback = handler_upp(_handler)
         self._carbon = carbon
 
-        types = EventTypeSpec()
-        types.eventClass = 0x6B657962  # 'keyb'
-        types.eventKind = 5  # kEventHotKeyPressed
+        types = (EventTypeSpec * 2)()
+        types[0].eventClass = 0x6B657962  # 'keyb'
+        types[0].eventKind = 5  # kEventHotKeyPressed
+        types[1].eventClass = 0x6B657962
+        types[1].eventKind = 6  # kEventHotKeyReleased
         handler_ref = event_ref()
         err = carbon.InstallEventHandler(
             carbon.GetApplicationEventTarget(),
             self._mac_callback,
-            1,
-            ctypes.byref(types),
+            2,
+            types,
             None,
             ctypes.byref(handler_ref),
         )
@@ -283,7 +341,7 @@ class GlobalHotkey(QObject):
 
         hotkey_id = EventHotKeyID()
         hotkey_id.signature = 0x4D414944  # 'MAID'
-        hotkey_id.id = 1
+        hotkey_id.id = self._hotkey_id
         hotkey_ref = event_ref()
         err = carbon.RegisterEventHotKey(
             keycode,
@@ -319,7 +377,7 @@ class GlobalHotkey(QObject):
         self._mac_callback = None
 
     # ---- Windows ----
-    def _register_win(self, mods, letter):
+    def _register_win(self, mods, key):
         from ctypes import wintypes  # noqa: F401
 
         native_mods = _MOD_NOREPEAT
@@ -331,7 +389,8 @@ class GlobalHotkey(QObject):
             native_mods |= _MOD_ALT
         if "meta" in mods:
             native_mods |= _MOD_WIN
-        vk = ord(letter)
+        vk = 0x20 if key == "SPACE" else ord(key)
+        self._win_vk = vk
 
         hwnd = 0
         if self._widget is not None:
@@ -345,12 +404,22 @@ class GlobalHotkey(QObject):
 
         from PySide6.QtWidgets import QApplication
 
-        self._win_filter = _WinHotkeyFilter(self._win_id, self._fire)
+        self._win_filter = _WinHotkeyFilter(self._win_id, self._on_win_pressed)
         app = QApplication.instance()
         if app is None:
             raise RuntimeError("no QApplication")
         app.installNativeEventFilter(self._win_filter)
         self.registered = True
+
+    def _on_win_pressed(self):
+        self._fire_pressed()
+        self._win_release_timer.start()
+
+    def _poll_win_release(self):
+        if self._win_vk is None:
+            return
+        if not (ctypes.windll.user32.GetAsyncKeyState(self._win_vk) & 0x8000):
+            self._fire_released()
 
     def _unregister_win(self):
         if self._win_hwnd is None:

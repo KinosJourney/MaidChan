@@ -7,7 +7,10 @@
 
 from .character_state import Action, Mode
 from .notifications import NotificationManager
+from .proactive_chat_service import ProactiveChatService
+from .reminder_service import ReminderService
 from .scheduler import Scheduler
+from .sound import ChimePlayer
 from .state_machine import CharacterStateMachine
 
 __all__ = [
@@ -16,4 +19,7 @@ __all__ = [
     "Scheduler",
     "CharacterStateMachine",
     "NotificationManager",
+    "ProactiveChatService",
+    "ReminderService",
+    "ChimePlayer",
 ]

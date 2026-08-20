@@ -6,6 +6,7 @@ from .client import ChatWorker
 from .memory_extractor import MemoryExtractWorker
 from .memory_retriever import retrieve_memories_sync
 from .messages import build_chat_messages
+from .todo_extractor import TodoParseWorker
 
 __all__ = [
     "get_deepseek_api_key",
@@ -13,4 +14,5 @@ __all__ = [
     "MemoryExtractWorker",
     "retrieve_memories_sync",
     "build_chat_messages",
+    "TodoParseWorker",
 ]

@@ -9,11 +9,14 @@ import shutil
 import tempfile
 import unittest
 
+from datetime import datetime, timedelta
+
 from maidchan.storage.json_io import load_json, save_json
 from maidchan.storage.history import HistoryStore
 from maidchan.storage.memory import MemoryStore
 from maidchan.storage.pomodoro_stats import PomodoroStats
 from maidchan.storage.profile import Profile
+from maidchan.storage.todo import TodoStore, STATUS_DONE, STATUS_PENDING
 from maidchan.llm.messages import build_chat_messages
 from maidchan.ui.text_utils import split_sentences
 
@@ -291,6 +294,104 @@ class BuildMessagesWithMemoryTest(unittest.TestCase):
             system_prompt="P", profile=prof, history=hist, memories=None
         )
         self.assertEqual(msgs[0]["content"], "P")
+
+
+class TodoStoreTest(TempDirTestCase):
+    def _store(self, advance=2):
+        return TodoStore(os.path.join(self.tmp, "todos.json"), advance_minutes=advance)
+
+    def test_add_and_defaults(self):
+        s = self._store()
+        now = datetime(2026, 8, 20, 10, 0, 0)
+        due = now + timedelta(hours=1)
+        item = s.add("开会", due, source="voice", now=now)
+        self.assertIsNotNone(item)
+        self.assertEqual(item["content"], "开会")
+        self.assertEqual(item["due_at"], "2026-08-20 11:00:00")
+        self.assertEqual(item["status"], STATUS_PENDING)
+        self.assertEqual(item["source"], "voice")
+        # 距离截止还很久：提前提醒未标记
+        self.assertIsNone(item["pre_reminded_at"])
+        self.assertIsNone(item["due_reminded_at"])
+
+    def test_add_rejects_empty_or_bad_time(self):
+        s = self._store()
+        self.assertIsNone(s.add("", datetime.now() + timedelta(hours=1)))
+        self.assertIsNone(s.add("有内容", "not-a-time"))
+
+    def test_add_within_advance_skips_pre_reminder(self):
+        s = self._store(advance=2)
+        now = datetime(2026, 8, 20, 10, 0, 0)
+        # 距离截止只有 1 分钟 < 2 分钟提前量
+        item = s.add("马上开会", now + timedelta(minutes=1), now=now)
+        self.assertIsNotNone(item["pre_reminded_at"])
+        self.assertIsNone(item["due_reminded_at"])
+
+    def test_update_content_and_time_resets_flags(self):
+        s = self._store()
+        now = datetime(2026, 8, 20, 10, 0, 0)
+        item = s.add("开会", now + timedelta(hours=1), now=now)
+        s.mark_pre_reminded(item["id"], now=now)
+        # 改时间应重置提醒标记
+        s.update(item["id"], content="改成开长会",
+                 due_at=now + timedelta(hours=2), now=now)
+        again = s.get(item["id"])
+        self.assertEqual(again["content"], "改成开长会")
+        self.assertEqual(again["due_at"], "2026-08-20 12:00:00")
+        self.assertIsNone(again["pre_reminded_at"])
+        self.assertIsNone(again["due_reminded_at"])
+
+    def test_status_transitions(self):
+        s = self._store()
+        item = s.add("吃药", datetime.now() + timedelta(hours=1))
+        self.assertTrue(s.mark_done(item["id"]))
+        self.assertEqual(s.get(item["id"])["status"], STATUS_DONE)
+        self.assertEqual(s.pending(), [])
+        self.assertEqual(len(s.done()), 1)
+        self.assertTrue(s.mark_pending(item["id"]))
+        self.assertEqual(len(s.pending()), 1)
+
+    def test_mark_due_also_marks_pre(self):
+        s = self._store()
+        now = datetime(2026, 8, 20, 10, 0, 0)
+        item = s.add("交报告", now + timedelta(hours=1), now=now)
+        s.mark_due_reminded(item["id"], now=now)
+        again = s.get(item["id"])
+        self.assertIsNotNone(again["due_reminded_at"])
+        self.assertIsNotNone(again["pre_reminded_at"])
+
+    def test_delete_and_clear(self):
+        s = self._store()
+        a = s.add("A", datetime.now() + timedelta(hours=1))
+        s.add("B", datetime.now() + timedelta(hours=2))
+        self.assertTrue(s.delete(a["id"]))
+        self.assertFalse(s.delete("nonexistent"))
+        self.assertEqual(len(s.items), 1)
+        s.clear()
+        self.assertEqual(s.items, [])
+
+    def test_sorted_pending_by_due(self):
+        s = self._store()
+        now = datetime(2026, 8, 20, 10, 0, 0)
+        s.add("晚", now + timedelta(hours=3), now=now)
+        s.add("早", now + timedelta(hours=1), now=now)
+        order = [t["content"] for t in s.sorted_pending()]
+        self.assertEqual(order, ["早", "晚"])
+
+    def test_persistence_reload(self):
+        path = os.path.join(self.tmp, "todos.json")
+        s1 = TodoStore(path)
+        s1.add("记住我", datetime.now() + timedelta(hours=1))
+        s2 = TodoStore(path)
+        self.assertEqual(s2.pending_count, 1)
+        self.assertEqual(s2.pending()[0]["content"], "记住我")
+
+    def test_corrupted_json_recovers(self):
+        path = os.path.join(self.tmp, "todos.json")
+        with open(path, "w") as f:
+            f.write("NOT JSON")
+        s = TodoStore(path)
+        self.assertEqual(s.items, [])
 
 
 class SplitSentencesTest(unittest.TestCase):

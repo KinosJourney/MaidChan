@@ -53,6 +53,8 @@ HISTORY_PATH = os.path.join(DATA_DIR, "history.json")
 MEMORY_PATH = os.path.join(DATA_DIR, "memories.json")
 MEMORY_BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 POMODORO_STATS_PATH = os.path.join(DATA_DIR, "pomodoro_stats.json")
+TODOS_PATH = os.path.join(DATA_DIR, "todos.json")
+CONTENT_CACHE_PATH = os.path.join(DATA_DIR, "content_cache.json")
 
 PIC_DIR = os.path.join(resource_dir(), "pic")
 APP_ICON = os.path.join(PIC_DIR, "app-icon.png")

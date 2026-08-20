@@ -37,22 +37,49 @@ from PySide6.QtWidgets import (
 from ..audio import AudioRecorder, SpeechRecognizeWorker, get_stt_env_config
 from ..config.constants import (
     CHARACTER_HEIGHT,
+    CONTENT_FEED_SOURCES,
     DEFAULT_PLAYLIST_HOTKEY,
     DEFAULT_PLAYLIST_URL,
     DEFAULT_STT_BASE_URL,
     DEFAULT_STT_LANGUAGE,
     DEFAULT_STT_MODEL,
     DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_VOICE_HOTKEY,
     MAX_CONTEXT_TURNS,
     MAX_MEMORY_INJECT,
     MAX_RECORDING_SECONDS,
+    PROACTIVE_CATEGORIES,
+    PROACTIVE_CATEGORY_LABELS,
+    PROACTIVE_CHAT_ENABLED_DEFAULT,
+    PROACTIVE_CHAT_PRIORITY,
+    PROACTIVE_LOCAL_POOLS,
+    REMINDER_PRIORITY,
 )
-from ..config.paths import DATA_DIR, HISTORY_PATH, MEMORY_PATH, MEMORY_BACKUP_DIR, IMG_BLINK, IMG_OPEN, IMG_ORIGIN
-from ..core import CharacterStateMachine, NotificationManager, Scheduler
+from ..config.paths import (
+    CONTENT_CACHE_PATH,
+    DATA_DIR,
+    HISTORY_PATH,
+    MEMORY_PATH,
+    MEMORY_BACKUP_DIR,
+    TODOS_PATH,
+    IMG_BLINK,
+    IMG_OPEN,
+    IMG_ORIGIN,
+)
+from ..core import (
+    CharacterStateMachine,
+    ChimePlayer,
+    NotificationManager,
+    ProactiveChatService,
+    ReminderService,
+    Scheduler,
+)
+from ..core.content_feed import ContentRefreshWorker
 from ..llm.client import ChatWorker
 from ..llm.memory_extractor import MemoryExtractWorker
 from ..llm.memory_retriever import retrieve_memories_sync
 from ..llm.messages import build_chat_messages
+from ..llm.todo_extractor import TodoParseWorker
 from ..playlist import (
     GlobalHotkey,
     PlaylistWorker,
@@ -60,16 +87,37 @@ from ..playlist import (
     qt_key_sequence,
     short_title,
 )
+from ..storage.content_cache import ContentCache
 from ..storage.history import HistoryStore
 from ..storage.memory import MemoryStore
 from ..storage.profile import Profile
 from ..storage.pomodoro_stats import PomodoroStats
 from ..storage.settings import Settings
-from .dialogs import HelpDialog, HistoryDialog, MemoryDialog, PomodoroDialog, ProfileDialog, SettingsDialog
+from ..storage.todo import TodoStore, parse_dt
+from .dialogs import (
+    HelpDialog,
+    HistoryDialog,
+    MemoryDialog,
+    PomodoroDialog,
+    ProfileDialog,
+    SettingsDialog,
+    TodoListDialog,
+)
 from .image_loader import pixmap_from_image_dewhite
 from .macos_window import show_on_all_spaces
 from .speech_bubble import SpeechBubble
 from .text_utils import split_sentences
+
+
+def _todo_log(msg):
+    """待办诊断日志：同时打印到终端并追加到用户数据目录，方便排查。"""
+    line = "%s [待办] %s" % (datetime.now().strftime("%H:%M:%S"), msg)
+    print(line)
+    try:
+        with open(os.path.join(DATA_DIR, "todo_debug.log"), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 class MaidPet(QWidget):
@@ -216,6 +264,40 @@ class MaidPet(QWidget):
         self._idle_greeted = False
         self.scheduler.schedule_repeating("idle", 30000, self._check_idle)
 
+        # 待办提醒：语音 / 手动创建的事项，到点前后用高优先级气泡提醒。
+        self.todos = TodoStore(TODOS_PATH)
+        self._reminder_chime = ChimePlayer(self)
+        self.reminders = ReminderService(
+            store=self.todos,
+            scheduler=self.scheduler,
+            notify=self._remind,
+            play_sound=self._reminder_chime.play,
+            name_getter=lambda: (
+                self.profile.get("call_me") or self.profile.get("nickname") or "主人"
+            ),
+        )
+        self.reminders.start()
+        self._todo_parse_worker = None
+        self._todo_list_dialog = None
+
+        # 主动陪聊：空闲且未使用番茄钟时，主动聊新闻 / 八卦 / 哲学 / 稀奇知识。
+        self._pending_topic = None       # 当前主动话题对应的内容条目 / 优先级
+        self._content_worker = None
+        self.content_cache = ContentCache(
+            CONTENT_CACHE_PATH, local_pools=PROACTIVE_LOCAL_POOLS,
+        )
+        self.proactive_chat = ProactiveChatService(
+            scheduler=self.scheduler,
+            trigger=self._trigger_proactive_chat,
+            pick_item=self.content_cache.pick,
+            request_refresh=self._refresh_content,
+            is_blocked=self._chat_busy,
+            is_pomodoro_running=lambda: self._pomodoro_dialog.is_running,
+            idle_seconds=lambda: time.time() - self.last_active,
+            settings_getter=self.settings.get,
+        )
+        self.proactive_chat.start()
+
         # 番茄钟：倒计时标签贴在角色旁边
         self._pomodoro_stats = PomodoroStats()
         self._pomo_label = QLabel(self)
@@ -255,6 +337,7 @@ class MaidPet(QWidget):
         self._last_playlist_bvid = None
         self._last_playlist_at = 0.0
         self._setup_playlist_shortcut()
+        self._setup_voice_shortcut()
 
         # 恢复窗口位置
         self.adjustSize()
@@ -442,9 +525,19 @@ class MaidPet(QWidget):
     def show_local(self, text):
         self.notifications.show(text, record=False)
 
-    def say(self, text, record=False):
+    def say(self, text, record=False, priority=0):
         # 说话通道统一走通知管理器；嘴巴 / 眨眼由状态机决定。
-        self.notifications.show(text, record=record)
+        self.notifications.show(text, record=record, priority=priority)
+
+    def _chat_busy(self):
+        """是否正忙（对话中 / 录音 / 识别中 / 气泡显示中），用于主动陪聊门控。"""
+        return bool(
+            (self.worker is not None and self.worker.isRunning())
+            or self.notifications.is_busy()
+            or self._action_busy
+            or self._recorder.is_recording
+            or (self._stt_worker is not None and self._stt_worker.isRunning())
+        )
 
     # ===================== 空闲 / 问候 =====================
     def greet(self):
@@ -464,16 +557,26 @@ class MaidPet(QWidget):
         self.show_local(msg)
 
     def start_new_topic(self):
-        """通过 LLM 让 Maid 主动开启一个新话题。"""
+        """菜单「和我打个招呼」：让 Maid 主动开启一个随意的新话题。"""
         if self.worker and self.worker.isRunning():
             self.show_local("稍等，我还在想上一句呢～")
             return
+        self._begin_topic(category=None, item=None, priority=0)
 
+    def _trigger_proactive_chat(self, category, item):
+        """主动陪聊服务的回调：就一条内容找主人聊。成功启动返回 True。"""
+        if self.worker and self.worker.isRunning():
+            return False
+        return self._begin_topic(category=category, item=item,
+                                 priority=PROACTIVE_CHAT_PRIORITY)
+
+    def _begin_topic(self, category, item, priority):
+        """构建主动话题的 messages 并发起 LLM 请求。"""
         self.last_active = time.time()
-        self._idle_greeted = False
+        # 主动聊天已接管这一轮空闲陪伴，避免本地 idle 提示再叠加。
+        self._idle_greeted = True
 
         recent_memories = self.memory.get_recent_important(limit=MAX_MEMORY_INJECT)
-
         messages = build_chat_messages(
             system_prompt=self.system_prompt,
             profile=self.profile,
@@ -481,20 +584,14 @@ class MaidPet(QWidget):
             memories=recent_memories,
             max_context_turns=MAX_CONTEXT_TURNS,
         )
-
-        hour = datetime.now().hour
-        name = self.profile.get("call_me") or self.profile.get("nickname") or "主人"
         messages.append({
             "role": "user",
-            "content": (
-                "[系统指令，非用户发言] 现在请你主动开启一个新话题和%s聊天。"
-                "可以根据你对%s的了解（记忆中的信息）、当前时间（%d 点）、"
-                "或是你自己感兴趣的话题来发起对话。"
-                "要自然随意，就像朋友突然想找人聊天一样，"
-                "不要说「有什么可以帮你的」之类的客服话术，"
-                "也不要重复之前说过的话。"
-            ) % (name, name, hour),
+            "content": self._topic_instruction(category, item),
         })
+
+        if item is not None:
+            self.content_cache.mark_used(item)
+        self._pending_topic = {"item": item, "priority": priority}
 
         self._set_action_busy(True)
         self.state.begin_thinking()
@@ -503,17 +600,93 @@ class MaidPet(QWidget):
         self.worker.finished_ok.connect(self._on_topic_reply)
         self.worker.failed.connect(self._on_topic_failed)
         self.worker.start()
+        return True
+
+    def _topic_instruction(self, category, item):
+        """根据类别和内容条目，拼出给模型的主动开话题系统指令。"""
+        name = self.profile.get("call_me") or self.profile.get("nickname") or "主人"
+        hour = datetime.now().hour
+
+        if item is not None:
+            label = PROACTIVE_CATEGORY_LABELS.get(category, "话题")
+            source = item.get("source") or ""
+            title = item.get("title") or ""
+            summary = item.get("summary") or ""
+            return (
+                "[系统指令，非用户发言] 下面是一条「%s」素材，请你用 Maid 的口吻，"
+                "自然地把它分享给%s并简短点评（1~3 句，像朋友刷手机时随口聊起）。"
+                "只能依据我给出的标题和摘要来说，不要编造我没有提供的细节、数字或结论，"
+                "不确定就用「好像」「据说」带过。最后自然地抛出一个问题，邀请%s继续聊。"
+                "不要复述「以下是」之类的话，也不要标注来源。\n"
+                "【%s·来源：%s】\n标题：%s\n摘要：%s"
+            ) % (label, name, name, label, source, title, summary)
+
+        # 无具体内容：回退到随意闲聊（与旧行为一致）。
+        return (
+            "[系统指令，非用户发言] 现在请你主动开启一个新话题和%s聊天。"
+            "可以根据你对%s的了解（记忆中的信息）、当前时间（%d 点）、"
+            "或是你自己感兴趣的话题来发起对话。"
+            "要自然随意，就像朋友突然想找人聊天一样，"
+            "不要说「有什么可以帮你的」之类的客服话术，"
+            "也不要重复之前说过的话。"
+        ) % (name, name, hour)
 
     def _on_topic_reply(self, content):
         self._set_action_busy(False)
-        self.history.add("maid", content)
-        self.say(content)
+        pending = self._pending_topic or {}
+        self._pending_topic = None
+        item = pending.get("item")
+        priority = pending.get("priority", 0)
+
+        display = content
+        record = content
+        if item and item.get("source"):
+            display = "%s\n（via %s）" % (content, item["source"])
+            link = item.get("link") or ""
+            record = "%s\n[来源] %s %s" % (content, item["source"], link.strip())
+        self.history.add("maid", record)
+        self.say(display, priority=priority)
 
     def _on_topic_failed(self, err):
         self._set_action_busy(False)
+        self._pending_topic = None
         self.greet()
 
+    # ---- 主动陪聊内容源 ----
+    def _refresh_content(self):
+        """后台抓取 RSS 内容源，抓完写入缓存。"""
+        if self._content_worker is not None and self._content_worker.isRunning():
+            return
+        self._content_worker = ContentRefreshWorker(CONTENT_FEED_SOURCES, parent=self)
+        self._content_worker.finished_ok.connect(self._on_content_refreshed)
+        self._content_worker.start()
+
+    def _on_content_refreshed(self, category_items):
+        self.content_cache.update(category_items)
+
+    def _test_proactive_chat(self, categories=None):
+        """设置面板「立即试聊」按钮：不受空闲 / 间隔 / 番茄钟限制，直接试发一条。"""
+        if self.worker and self.worker.isRunning():
+            self.show_local("稍等，我还在想上一句呢～")
+            return
+        cats = [c for c in (categories or []) if c in PROACTIVE_CATEGORIES]
+        if not cats:
+            cats = list(PROACTIVE_CATEGORIES)
+        order = list(cats)
+        random.shuffle(order)
+        for category in order:
+            item = self.content_cache.pick(category)
+            if item is not None:
+                self._trigger_proactive_chat(category, item)
+                return
+        # 选的类别暂时都没有内容（如新闻 / 八卦还没抓到）：先去抓一批。
+        self._refresh_content()
+        self.show_local("内容还在路上，我先去抓一批新闻，稍等一下再点一次试试～")
+
     def _check_idle(self):
+        # 主动陪聊已开启时，由它负责空闲陪伴，这里不再叠加本地提示。
+        if self.settings.get("proactive_chat_enabled", PROACTIVE_CHAT_ENABLED_DEFAULT):
+            return
         idle = time.time() - self.last_active
         if idle > 600 and not self._idle_greeted and not self.state.is_speaking:
             self._idle_greeted = True
@@ -526,6 +699,27 @@ class MaidPet(QWidget):
             self.show_local(random.choice(tips))
 
     # ===================== 输入区操作按钮 / 语音输入 =====================
+    def _setup_voice_shortcut(self):
+        self._global_voice_hotkey = GlobalHotkey(
+            DEFAULT_VOICE_HOTKEY, widget=self, parent=self
+        )
+        self._global_voice_hotkey.pressed.connect(self._on_push_to_talk_pressed)
+        self._global_voice_hotkey.released.connect(self._on_push_to_talk_released)
+
+    def _on_push_to_talk_pressed(self):
+        if self._action_busy or self._recorder.is_recording:
+            return
+        if self._stt_worker and self._stt_worker.isRunning():
+            return
+        if self._input_text():
+            self.show_local("输入框里还有内容，请先发送后再使用语音快捷键～")
+            return
+        self._start_recording()
+
+    def _on_push_to_talk_released(self):
+        if self._recorder.is_recording:
+            self._stop_recording()
+
     def eventFilter(self, obj, event):
         if obj is self.input_edit and event.type() == QEvent.KeyPress:
             key = event.key()
@@ -794,11 +988,13 @@ class MaidPet(QWidget):
         self._hide_voice_bar()
         self.input_edit.setPlainText(text)
         self.input_edit.moveCursor(QTextCursor.End)
-        self.input_edit.setFocus()
         # 布局稳定后再算一次高度，避免刚显示时宽度不准
         self._adjust_input_height()
         self.scheduler.schedule_once("input_height", 50, self._adjust_input_height)
         self._reset_voice_ui()
+        # 语音识别成功后立即发送；待办识别仅作为独立的后台附加处理。
+        self.on_send()
+        self._maybe_parse_todo(text)
 
     def _on_stt_failed(self, err):
         debug_path = os.path.join(DATA_DIR, "last_recording.wav")
@@ -816,6 +1012,68 @@ class MaidPet(QWidget):
     def _reset_voice_ui(self):
         self._hide_voice_bar()
         self._refresh_action_btn()
+
+    # ===================== 待办提醒 =====================
+    def _remind(self, text, priority=REMINDER_PRIORITY):
+        """提醒服务的通知回调：走高优先级气泡，不被普通闲聊顶掉。"""
+        self.notifications.show(text, priority=priority)
+
+    def _maybe_parse_todo(self, text):
+        """在后台判断语音是否为待办，不阻塞或控制聊天消息发送。"""
+        if not text.strip():
+            return
+        _todo_log("开始解析语音文本：%s" % text)
+        if self._todo_parse_worker and self._todo_parse_worker.isRunning():
+            _todo_log("上一次解析仍在进行，跳过本次待办解析")
+            return
+        self._todo_parse_worker = TodoParseWorker(text, datetime.now(), self)
+        self._todo_parse_worker.parsed.connect(self._on_todo_parsed)
+        self._todo_parse_worker.failed.connect(self._on_todo_parse_failed)
+        self._todo_parse_worker.start()
+
+    def _on_todo_parsed(self, result):
+        _todo_log("解析结果：%r" % (result,))
+        if not result.get("is_todo"):
+            return
+        content = result.get("content", "").strip()
+        due_dt = parse_dt(result.get("due_at"))
+        if not content or due_dt is None:
+            _todo_log("内容或时间无效，未创建")
+            return
+        item = self.todos.add(content, due_dt, source="voice")
+        if item is None:
+            _todo_log("todos.add 返回 None，创建失败")
+            return
+        _todo_log("已创建待办 id=%s content=%s due=%s"
+                  % (item.get("id"), content, item.get("due_at")))
+        self.reminders.refresh()
+        if self._todo_list_dialog is not None:
+            self._todo_list_dialog.refresh()
+        when = due_dt.strftime("%m月%d日 %H:%M")
+        self.show_local(
+            "好的，已加入待办：「%s」，我会在 %s 提前提醒你～（右键「待办事项」可修改或删除）"
+            % (content, when)
+        )
+
+    def _on_todo_parse_failed(self, err):
+        _todo_log("解析失败：%s" % err)
+
+    def open_todos(self):
+        if self._todo_list_dialog is not None:
+            self._todo_list_dialog.refresh()
+            self._place_dialog_on_screen(self._todo_list_dialog)
+            self._todo_list_dialog.raise_()
+            self._todo_list_dialog.activateWindow()
+            return
+        self._todo_list_dialog = TodoListDialog(
+            self.todos, on_changed=self.reminders.refresh, parent=None
+        )
+        self._todo_list_dialog.setAttribute(Qt.WA_DeleteOnClose)
+        self._todo_list_dialog.destroyed.connect(
+            lambda: setattr(self, "_todo_list_dialog", None)
+        )
+        self._place_dialog_on_screen(self._todo_list_dialog)
+        self._todo_list_dialog.show()
 
     # ===================== 番茄钟 =====================
     def open_pomodoro(self):
@@ -944,6 +1202,12 @@ class MaidPet(QWidget):
         act_pomo.triggered.connect(self.open_pomodoro)
         menu.addAction(act_pomo)
 
+        pending = self.todos.pending_count
+        todo_text = ("待办事项（%d）…" % pending) if pending else "待办事项…"
+        act_todo = QAction(todo_text, self)
+        act_todo.triggered.connect(self.open_todos)
+        menu.addAction(act_todo)
+
         menu.addAction(self.act_playlist)
 
         menu.addSeparator()
@@ -999,7 +1263,12 @@ class MaidPet(QWidget):
         self._memory_dialog.show()
 
     def open_settings(self):
-        dlg = SettingsDialog(self.settings, on_saved=self._on_settings_saved, parent=self)
+        dlg = SettingsDialog(
+            self.settings,
+            on_saved=self._on_settings_saved,
+            on_test_proactive=self._test_proactive_chat,
+            parent=self,
+        )
         self._place_dialog_on_screen(dlg)
         dlg.exec()
 
@@ -1136,12 +1405,20 @@ class MaidPet(QWidget):
             self._recorder.cancel()
         if self._global_hotkey is not None:
             self._global_hotkey.unregister()
+        if self._global_voice_hotkey is not None:
+            self._global_voice_hotkey.unregister()
         if self._playlist_worker is not None and self._playlist_worker.isRunning():
             self._playlist_worker.wait(2000)
         if self.worker is not None and self.worker.isRunning():
             self.worker.wait(3000)
         if self._stt_worker is not None and self._stt_worker.isRunning():
             self._stt_worker.wait(3000)
+        if self._todo_parse_worker is not None and self._todo_parse_worker.isRunning():
+            self._todo_parse_worker.wait(3000)
+        if self._content_worker is not None and self._content_worker.isRunning():
+            self._content_worker.wait(3000)
+        if self._todo_list_dialog is not None:
+            self._todo_list_dialog.close()
         self._pomodoro_dialog.close()
         self.bubble.close()
 

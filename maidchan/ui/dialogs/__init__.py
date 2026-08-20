@@ -7,6 +7,7 @@ from .memory_dialog import MemoryDialog
 from .pomodoro_dialog import PomodoroDialog
 from .profile_dialog import ProfileDialog
 from .settings_dialog import SettingsDialog
+from .todo_dialog import TodoEditDialog, TodoListDialog
 
 __all__ = [
     "HistoryDialog",
@@ -15,4 +16,6 @@ __all__ = [
     "SettingsDialog",
     "ProfileDialog",
     "HelpDialog",
+    "TodoEditDialog",
+    "TodoListDialog",
 ]

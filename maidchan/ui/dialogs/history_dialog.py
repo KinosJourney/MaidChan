@@ -66,7 +66,7 @@ class HistoryDialog(QDialog):
             self.vbox.addWidget(empty)
             return
 
-        for it in self.history.items:
+        for it in reversed(self.history.items):
             row = QFrame()
             row.setStyleSheet(
                 "QFrame { border-bottom: 1px solid #eee; }"

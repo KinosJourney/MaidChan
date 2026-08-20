@@ -5,13 +5,9 @@
 本窗口只提供时长选择、开始/取消、当日计数查看。
 """
 
-import os
-import struct
-import tempfile
 import time
-import wave
 
-from PySide6.QtCore import QEvent, QUrl, Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -21,11 +17,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-try:
-    from PySide6.QtMultimedia import QSoundEffect
-except ImportError:  # QtMultimedia 不可用时降级为无声
-    QSoundEffect = None
-
+from ...core.sound import ChimePlayer
 from ...config.constants import (
     DEFAULT_POMODORO_MINUTES,
     DEFAULT_REST_MINUTES,
@@ -92,8 +84,7 @@ class PomodoroDialog(QDialog):
         self._tick_timer.setInterval(200)
         self._tick_timer.timeout.connect(self._tick)
 
-        self._sound = None
-        self._sound_path = None
+        self._chime = ChimePlayer(self)
 
         self.setWindowTitle("番茄钟")
         self.setFixedSize(300, 420)
@@ -369,56 +360,8 @@ class PomodoroDialog(QDialog):
 
     # ---- 音效 ----
 
-    def _sound_file(self):
-        """生成（或复用）提示音 WAV 文件，返回路径；失败返回 None。"""
-        if self._sound_path and os.path.exists(self._sound_path):
-            return self._sound_path
-        try:
-            path = os.path.join(
-                tempfile.gettempdir(), "maidchan_pomodoro_ding.wav"
-            )
-            if not os.path.exists(path):
-                self._generate_ding(path)
-            self._sound_path = path
-            return path
-        except Exception:
-            return None
-
-    @staticmethod
-    def _generate_ding(path):
-        """生成一段简短的「叮咚」双音提示音。"""
-        import math
-
-        framerate = 44100
-        amplitude = 18000
-        frames = bytearray()
-        # 两个音调：高音 -> 低音
-        for freq, dur in ((880.0, 0.18), (660.0, 0.28)):
-            count = int(framerate * dur)
-            for i in range(count):
-                # 淡出包络，避免爆音
-                env = 1.0 - (i / count)
-                sample = int(
-                    amplitude * env * math.sin(2 * math.pi * freq * i / framerate)
-                )
-                frames += struct.pack("<h", sample)
-        with wave.open(path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(framerate)
-            wf.writeframes(bytes(frames))
-
     def _play_sound(self):
-        if QSoundEffect is None:
-            return
-        path = self._sound_file()
-        if not path:
-            return
-        if self._sound is None:
-            self._sound = QSoundEffect(self)
-        self._sound.setSource(QUrl.fromLocalFile(path))
-        self._sound.setVolume(0.6)
-        self._sound.play()
+        self._chime.play()
 
     # ---- 辅助 ----
 
