@@ -20,6 +20,7 @@ from PySide6.QtGui import (
     QGuiApplication,
     QIcon,
     QPen,
+    QPolygon,
     QTextCursor,
     QTextOption,
 )
@@ -319,6 +320,20 @@ class MaidPet(QWidget):
         )
         self._pomo_label.setAlignment(Qt.AlignCenter)
         self._pomo_label.hide()
+        self._pomo_btn = QPushButton(self)
+        self._pomo_btn.setCursor(Qt.PointingHandCursor)
+        self._pomo_btn.setFixedSize(20, 20)
+        self._pomo_btn.setStyleSheet(
+            "QPushButton {"
+            "  background: rgba(255,183,197,0.78);"
+            "  border: none;"
+            "  border-radius: 14px; padding: 0;"
+            "}"
+            "QPushButton:hover { background: rgba(255,157,176,0.9); }"
+            "QPushButton:pressed { background: rgba(232,93,117,0.9); }"
+        )
+        self._pomo_btn.clicked.connect(self._on_pomo_control_clicked)
+        self._pomo_btn.hide()
         self._pomodoro_dialog = PomodoroDialog(
             stats=self._pomodoro_stats,
             on_complete=self._pomodoro_done,
@@ -1150,14 +1165,72 @@ class MaidPet(QWidget):
     def _pomodoro_state_changed(self, running):
         if running:
             self._pomo_label.show()
+            self._refresh_pomo_control()
+            self._pomo_btn.show()
+            self._position_pomo_label()
         else:
             self._pomo_label.hide()
+            self._pomo_btn.hide()
+
+    def _on_pomo_control_clicked(self):
+        if self._pomodoro_dialog.is_resting:
+            self._pomodoro_dialog.skip_rest()
+        else:
+            self._pomodoro_dialog.toggle_pause()
+            self._refresh_pomo_control()
+            self._position_pomo_label()
+
+    def _refresh_pomo_control(self):
+        self._pomo_btn.setText("")
+        self._pomo_btn.setIconSize(QSize(16, 16))
+        if self._pomodoro_dialog.is_resting:
+            self._pomo_btn.setIcon(self._make_pomo_control_icon("skip"))
+            self._pomo_btn.setToolTip("跳过本次休息")
+        elif self._pomodoro_dialog.is_paused:
+            self._pomo_btn.setIcon(self._make_pomo_control_icon("play"))
+            self._pomo_btn.setToolTip("继续专注倒计时")
+        else:
+            self._pomo_btn.setIcon(self._make_pomo_control_icon("pause"))
+            self._pomo_btn.setToolTip("暂停专注倒计时")
+
+    @staticmethod
+    def _make_pomo_control_icon(kind):
+        pm = QPixmap(32, 32)
+        pm.fill(Qt.transparent)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#ffffff"))
+        if kind == "pause":
+            painter.drawRoundedRect(7, 5, 6, 22, 2, 2)
+            painter.drawRoundedRect(19, 5, 6, 22, 2, 2)
+        elif kind == "play":
+            painter.drawPolygon(QPolygon([
+                QPoint(9, 5),
+                QPoint(26, 16),
+                QPoint(9, 27),
+            ]))
+        else:
+            painter.drawPolygon(QPolygon([
+                QPoint(5, 6),
+                QPoint(21, 16),
+                QPoint(5, 26),
+            ]))
+            painter.drawRoundedRect(22, 6, 5, 20, 2, 2)
+        painter.end()
+        return QIcon(pm)
 
     def _position_pomo_label(self):
         self._pomo_label.adjustSize()
-        cx = self.char_label.x() + self.char_label.width() - self._pomo_label.width() - 2
+        gap = 4
+        total_width = self._pomo_label.width() + gap + self._pomo_btn.width()
+        cx = self.char_label.x() + self.char_label.width() - total_width - 2
         cy = self.char_label.y() + 30
         self._pomo_label.move(cx, cy)
+        self._pomo_btn.move(
+            cx + self._pomo_label.width() + gap,
+            cy + (self._pomo_label.height() - self._pomo_btn.height()) // 2,
+        )
 
     def _pomodoro_done(self, count):
         name = self.profile.get("call_me") or "主人"

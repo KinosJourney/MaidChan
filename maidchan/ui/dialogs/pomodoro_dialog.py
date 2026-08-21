@@ -78,7 +78,9 @@ class PomodoroDialog(QDialog):
         self._on_rest_done = on_rest_done
 
         self._end_time = 0.0
+        self._paused_remaining = 0.0
         self._running = False
+        self._paused = False
         self._is_resting = False
         self._tick_timer = QTimer(self)
         self._tick_timer.setInterval(200)
@@ -265,7 +267,9 @@ class PomodoroDialog(QDialog):
     def _start(self):
         minutes = self._spin.value()
         self._end_time = time.monotonic() + minutes * 60
+        self._paused_remaining = 0.0
         self._running = True
+        self._paused = False
         self._is_resting = False
         self._set_inputs_enabled(False)
         self._start_btn.setText("取消专注")
@@ -280,6 +284,8 @@ class PomodoroDialog(QDialog):
         self._tick_timer.stop()
         resting = self._is_resting
         self._running = False
+        self._paused = False
+        self._paused_remaining = 0.0
         self._is_resting = False
         self._set_inputs_enabled(True)
         self._start_btn.setText("开始专注")
@@ -293,6 +299,8 @@ class PomodoroDialog(QDialog):
     def _complete(self):
         self._tick_timer.stop()
         self._running = False
+        self._paused = False
+        self._paused_remaining = 0.0
         self._is_resting = False
         self._set_inputs_enabled(True)
         self._start_btn.setText("开始专注")
@@ -316,7 +324,9 @@ class PomodoroDialog(QDialog):
     def _start_rest(self):
         minutes = self._rest_spin.value()
         self._end_time = time.monotonic() + minutes * 60
+        self._paused_remaining = 0.0
         self._running = True
+        self._paused = False
         self._is_resting = True
         self._set_inputs_enabled(False)
         self._start_btn.setText("跳过休息")
@@ -329,6 +339,8 @@ class PomodoroDialog(QDialog):
     def _rest_complete(self):
         self._tick_timer.stop()
         self._running = False
+        self._paused = False
+        self._paused_remaining = 0.0
         self._is_resting = False
         self._set_inputs_enabled(True)
         self._start_btn.setText("开始专注")
@@ -357,6 +369,29 @@ class PomodoroDialog(QDialog):
         self._status_label.setText("%s %s" % (prefix, text))
         if self._on_tick:
             self._on_tick(text)
+
+    def toggle_pause(self):
+        """暂停或继续当前专注倒计时；休息倒计时不支持暂停。"""
+        if not self._running or self._is_resting:
+            return
+        if self._paused:
+            self._end_time = time.monotonic() + self._paused_remaining
+            self._paused = False
+            self._tick_timer.start()
+            self._tick()
+            return
+
+        self._paused_remaining = max(0.0, self._end_time - time.monotonic())
+        self._paused = True
+        self._tick_timer.stop()
+        total_sec = max(1, int(self._paused_remaining) + 1)
+        mm, ss = divmod(total_sec, 60)
+        self._status_label.setText("已暂停 %02d:%02d" % (mm, ss))
+
+    def skip_rest(self):
+        """跳过当前休息倒计时。"""
+        if self._running and self._is_resting:
+            self._cancel()
 
     # ---- 音效 ----
 
@@ -387,6 +422,14 @@ class PomodoroDialog(QDialog):
     @property
     def is_running(self):
         return self._running
+
+    @property
+    def is_resting(self):
+        return self._is_resting
+
+    @property
+    def is_paused(self):
+        return self._paused
 
     def closeEvent(self, event):
         if self._running:
