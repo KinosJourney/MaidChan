@@ -120,8 +120,8 @@ class BuildMessagesTest(unittest.TestCase):
             max_context_turns=7,
         )
         self.assertEqual(msgs[0]["role"], "system")
-        self.assertEqual(
-            msgs[0]["content"], "【关于你的主人】\n昵称：A\n\n你是 Maid"
+        self.assertTrue(
+            msgs[0]["content"].startswith("【关于你的主人】\n昵称：A\n\n你是 Maid")
         )
         self.assertEqual(msgs[1], {"role": "user", "content": "hi"})
         self.assertEqual(hist.seen, 7)
@@ -132,7 +132,9 @@ class BuildMessagesTest(unittest.TestCase):
         msgs = build_chat_messages(
             system_prompt="P", profile=prof, history=hist
         )
-        self.assertEqual(msgs, [{"role": "system", "content": "P"}])
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertTrue(msgs[0]["content"].startswith("P"))
+        self.assertEqual(len(msgs), 1)
 
 
 class ProfilePrefixTest(TempDirTestCase):
@@ -231,6 +233,20 @@ class MemoryStoreTest(TempDirTestCase):
         self.assertTrue(len(results) >= 1)
         self.assertIn("火鸡面", results[0]["content"])
 
+    def test_search_by_keywords_matches_tags(self):
+        m = self._store()
+        m.add("preference", "用户喜欢看这部作品", tags=["动漫", "喜好"])
+        results = m.search_by_keywords(["动漫"])
+        self.assertEqual(len(results), 1)
+        self.assertIn("作品", results[0]["content"])
+
+    def test_search_by_keywords_skips_disabled(self):
+        m = self._store()
+        item = m.add("preference", "用户喜欢吃火鸡面", tags=["饮食"])
+        item["enabled"] = False
+        m.save()
+        self.assertEqual(m.search_by_keywords(["火鸡面"]), [])
+
     def test_search_by_tags(self):
         m = self._store()
         m.add("preference", "用户喜欢喝奶茶", tags=["饮食", "甜品"])
@@ -293,7 +309,24 @@ class BuildMessagesWithMemoryTest(unittest.TestCase):
         msgs = build_chat_messages(
             system_prompt="P", profile=prof, history=hist, memories=None
         )
-        self.assertEqual(msgs[0]["content"], "P")
+        content = msgs[0]["content"]
+        self.assertTrue(content.startswith("P"))
+        self.assertNotIn("- 用户", content)
+
+    def test_anti_fabrication_guard_always_present(self):
+        """无论有无记忆，都要带上防编造护栏。"""
+        prof = _FakeProfile("")
+        with_mem = build_chat_messages(
+            system_prompt="你是 Maid", profile=prof, history=_FakeHistory([]),
+            memories=[{"type": "preference", "content": "用户喜欢吃辣",
+                       "created_at": "2026-08-18 22:00:00"}],
+        )
+        without_mem = build_chat_messages(
+            system_prompt="你是 Maid", profile=prof, history=_FakeHistory([]),
+            memories=None,
+        )
+        for msgs in (with_mem, without_mem):
+            self.assertIn("不要编造", msgs[0]["content"])
 
 
 class TodoStoreTest(TempDirTestCase):

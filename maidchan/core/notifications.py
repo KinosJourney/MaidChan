@@ -29,18 +29,18 @@ class NotificationManager(QObject):
         bubble.on_geometry_changed = position_cb
 
     # ---- 对外接口 ----
-    def show(self, text, record=False, priority=0):
+    def show(self, text, record=False, priority=0, link=None):
         """显示一段话（会自动拆句）。
 
         ``record`` 参数保留以兼容旧签名；历史记录仍由调用方（对话流程）负责，
-        与旧版一致，这里不写入历史。
+        与旧版一致，这里不写入历史。``link`` 非空时气泡可点击打开浏览器（查证 / 看原文）。
         """
         # 高优先级消息正在显示时，不被更低优先级的消息打断。
         if self._bubble.isVisible() and priority < self._current_priority:
             return
         self._current_priority = priority
         sentences = self._split(text)
-        self._bubble.speak(sentences)
+        self._bubble.speak(sentences, link=link)
         self._position()
 
     def show_error(self, text):

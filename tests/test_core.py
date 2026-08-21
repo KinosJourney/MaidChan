@@ -127,6 +127,7 @@ class StubBubble:
     def __init__(self):
         self._visible = False
         self.spoken = []
+        self.links = []
         self.on_sentence_typing = None
         self.on_sentence_done = None
         self.on_all_done = None
@@ -135,9 +136,10 @@ class StubBubble:
     def isVisible(self):
         return self._visible
 
-    def speak(self, sentences):
+    def speak(self, sentences, link=None):
         self._visible = True
         self.spoken.append(sentences)
+        self.links.append(link)
 
 
 class StubState:

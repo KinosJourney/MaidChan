@@ -3,6 +3,7 @@
 
 import sys
 import time
+import webbrowser
 
 from PySide6.QtCore import (
     Qt,
@@ -85,6 +86,9 @@ class SpeechBubble(QWidget):
         self.sentence_index = 0
         self.is_last_sentence = False
 
+        # 可选：点击气泡打开的链接（查证 / 看原文）。为空则点击仅翻页。
+        self.link = None
+
         self.hide()
 
     def showEvent(self, event):
@@ -92,11 +96,16 @@ class SpeechBubble(QWidget):
         show_on_all_spaces(self)
 
     # ---- 对外接口 ----
-    def speak(self, sentences):
-        """开始说多句话。sentences 是字符串列表。"""
+    def speak(self, sentences, link=None):
+        """开始说多句话。sentences 是字符串列表。
+
+        link 非空时，气泡整体可点击，点击会用浏览器打开该链接（查证 / 看原文），
+        并显示放大镜标记与手型光标。每次说话都会重置 link。
+        """
         self.sentences = [s for s in sentences if s.strip()]
         if not self.sentences:
             return
+        self._set_link(link)
         self.sentence_index = 0
         self.opacity_effect.setOpacity(1.0)
         self._start_sentence(self.sentences[0])
@@ -164,6 +173,21 @@ class SpeechBubble(QWidget):
         if self.on_all_done:
             self.on_all_done()
 
+    # ---- 链接（查证 / 看原文） ----
+    def _set_link(self, link):
+        self.link = link or None
+        cursor = Qt.PointingHandCursor if self.link else Qt.ArrowCursor
+        self.setCursor(cursor)
+        self.label.setCursor(cursor)
+
+    def _open_link(self):
+        if not self.link:
+            return
+        try:
+            webbrowser.open(self.link, new=2)
+        except Exception:
+            pass
+
     # ---- 点击行为 ----
     def mousePressEvent(self, event):
         if self.type_timer.isActive():
@@ -174,6 +198,10 @@ class SpeechBubble(QWidget):
             return
         # 已打完，检查 0.5 秒防手滑锁
         if time.time() < self._click_lock_until:
+            return
+        # 有链接时，点击气泡打开浏览器查证 / 看原文（不翻页，交给计时器淡出）。
+        if self.link:
+            self._open_link()
             return
         # 进入下一句 / 结束
         self.stay_timer.stop()
@@ -221,3 +249,14 @@ class SpeechBubble(QWidget):
             QPoint(int(cx), int(self.height() - 1)),
         ]
         painter.drawPolygon(path_pts)
+
+        # 可点击查证时，在右上角画一个放大镜标记提示可点。
+        if self.link:
+            badge = QFont()
+            badge.setPointSize(11)
+            painter.setFont(badge)
+            painter.setPen(QColor(232, 93, 117, 235))
+            painter.drawText(
+                QRectF(rect.right() - 26, rect.top() + 4, 22, 20),
+                Qt.AlignCenter, "🔍",
+            )

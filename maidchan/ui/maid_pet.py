@@ -9,6 +9,7 @@ import time
 import webbrowser
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from PySide6.QtCore import Qt, QPoint, QSize, QEvent
 from PySide6.QtGui import (
@@ -77,7 +78,12 @@ from ..core import (
 from ..core.content_feed import ContentRefreshWorker
 from ..llm.client import ChatWorker
 from ..llm.memory_extractor import MemoryExtractWorker
-from ..llm.memory_retriever import retrieve_memories_sync
+from ..llm.memory_retriever import (
+    KeywordExtractWorker,
+    extract_local_keywords,
+    merge_keywords,
+    retrieve_memories_sync,
+)
 from ..llm.messages import build_chat_messages
 from ..llm.todo_extractor import TodoParseWorker
 from ..playlist import (
@@ -137,6 +143,7 @@ class MaidPet(QWidget):
         self._last_user_msg = ""
         self._current_memories = []
         self._memory_extract_worker = None
+        self._keyword_worker = None
 
         # macOS 上 Qt.Tool 会随应用失去焦点而隐藏，因此使用普通无边框窗口。
         flags = Qt.FramelessWindowHint
@@ -419,7 +426,7 @@ class MaidPet(QWidget):
         text = self.input_edit.toPlainText().strip()
         if not text:
             return
-        if self.worker and self.worker.isRunning():
+        if self._is_replying():
             self.show_local("稍等，我还在想上一句呢～")
             return
         self.input_edit.clear()
@@ -431,29 +438,56 @@ class MaidPet(QWidget):
         self._last_user_msg = text
         self.history.add("user", text)
 
-        # 从长期记忆中检索与当前消息相关的记忆
-        self._current_memories = self._retrieve_relevant_memories(text)
+        self._begin_retrieve_and_chat(text)
 
-        # 构建发给 API 的 messages
-        messages = self._build_messages()
+    def _is_replying(self):
+        """是否正在处理上一条消息（检索关键词 or 等待回复）。"""
+        if self.worker and self.worker.isRunning():
+            return True
+        if self._keyword_worker and self._keyword_worker.isRunning():
+            return True
+        return False
 
+    def _begin_retrieve_and_chat(self, text):
+        """混合召回：先本地高置信匹配，未命中再异步用模型抽关键词兜底。"""
         self._set_action_busy(True)
         self.state.begin_thinking()
 
+        local_keywords = extract_local_keywords(self.memory, text)
+        if local_keywords:
+            self._current_memories = retrieve_memories_sync(
+                self.memory, local_keywords, limit=MAX_MEMORY_INJECT
+            )
+            self._start_chat_worker()
+            return
+
+        # 本地没有高置信命中：交给模型抽关键词（无 API Key / 失败时会回空）
+        self._keyword_worker = KeywordExtractWorker(text, self)
+        self._keyword_worker.extracted.connect(self._on_keywords_ready)
+        self._keyword_worker.failed.connect(self._on_keywords_failed)
+        self._keyword_worker.start()
+
+    def _on_keywords_ready(self, keywords):
+        merged = merge_keywords(keywords)
+        if merged:
+            self._current_memories = retrieve_memories_sync(
+                self.memory, merged, limit=MAX_MEMORY_INJECT
+            )
+        else:
+            self._current_memories = []
+        self._start_chat_worker()
+
+    def _on_keywords_failed(self, err):
+        # 关键词提取失败不影响正常聊天，只是这轮不带记忆
+        self._current_memories = []
+        self._start_chat_worker()
+
+    def _start_chat_worker(self):
+        messages = self._build_messages()
         self.worker = ChatWorker(messages, self)
         self.worker.finished_ok.connect(self._on_reply)
         self.worker.failed.connect(self._on_reply_failed)
         self.worker.start()
-
-    def _retrieve_relevant_memories(self, user_msg):
-        """同步检索相关记忆：用简单关键词匹配，不额外调 API。"""
-        words = [w for w in user_msg if len(w.strip()) > 0]
-        keywords = []
-        for segment in user_msg.replace("，", " ").replace("。", " ").replace(
-            "！", " ").replace("？", " ").replace("、", " ").split():
-            if len(segment) >= 2:
-                keywords.append(segment)
-        return retrieve_memories_sync(self.memory, keywords, limit=MAX_MEMORY_INJECT)
 
     def _build_messages(self):
         return build_chat_messages(
@@ -525,9 +559,9 @@ class MaidPet(QWidget):
     def show_local(self, text):
         self.notifications.show(text, record=False)
 
-    def say(self, text, record=False, priority=0):
+    def say(self, text, record=False, priority=0, link=None):
         # 说话通道统一走通知管理器；嘴巴 / 眨眼由状态机决定。
-        self.notifications.show(text, record=record, priority=priority)
+        self.notifications.show(text, record=record, priority=priority, link=link)
 
     def _chat_busy(self):
         """是否正忙（对话中 / 录音 / 识别中 / 气泡显示中），用于主动陪聊门控。"""
@@ -558,14 +592,14 @@ class MaidPet(QWidget):
 
     def start_new_topic(self):
         """菜单「和我打个招呼」：让 Maid 主动开启一个随意的新话题。"""
-        if self.worker and self.worker.isRunning():
+        if self._is_replying():
             self.show_local("稍等，我还在想上一句呢～")
             return
         self._begin_topic(category=None, item=None, priority=0)
 
     def _trigger_proactive_chat(self, category, item):
         """主动陪聊服务的回调：就一条内容找主人聊。成功启动返回 True。"""
-        if self.worker and self.worker.isRunning():
+        if self._is_replying():
             return False
         return self._begin_topic(category=category, item=item,
                                  priority=PROACTIVE_CHAT_PRIORITY)
@@ -640,12 +674,28 @@ class MaidPet(QWidget):
 
         display = content
         record = content
-        if item and item.get("source"):
-            display = "%s\n（via %s）" % (content, item["source"])
-            link = item.get("link") or ""
-            record = "%s\n[来源] %s %s" % (content, item["source"], link.strip())
+        link = None
+        if item:
+            link = self._topic_link(item)
+            source = item.get("source") or ""
+            has_url = (item.get("link") or "").strip().startswith("http")
+            hint = "（🔍 点我看原文·%s）" % source if has_url else "（🔍 点我查证）"
+            display = "%s\n%s" % (content, hint)
+            record = "%s\n[来源] %s %s" % (
+                content, source, (item.get("link") or "").strip() or link,
+            )
         self.history.add("maid", record)
-        self.say(display, priority=priority)
+        self.say(display, priority=priority, link=link)
+
+    def _topic_link(self, item):
+        """点击气泡要打开的链接：RSS 用原文链接，本地话题用搜索引擎查证。"""
+        url = (item.get("link") or "").strip()
+        if url.startswith("http"):
+            return url
+        query = (item.get("title") or item.get("summary") or "").strip()
+        if not query:
+            return None
+        return "https://www.google.com/search?q=" + quote(query)
 
     def _on_topic_failed(self, err):
         self._set_action_busy(False)
@@ -666,7 +716,7 @@ class MaidPet(QWidget):
 
     def _test_proactive_chat(self, categories=None):
         """设置面板「立即试聊」按钮：不受空闲 / 间隔 / 番茄钟限制，直接试发一条。"""
-        if self.worker and self.worker.isRunning():
+        if self._is_replying():
             self.show_local("稍等，我还在想上一句呢～")
             return
         cats = [c for c in (categories or []) if c in PROACTIVE_CATEGORIES]
@@ -1411,6 +1461,8 @@ class MaidPet(QWidget):
             self._playlist_worker.wait(2000)
         if self.worker is not None and self.worker.isRunning():
             self.worker.wait(3000)
+        if self._keyword_worker is not None and self._keyword_worker.isRunning():
+            self._keyword_worker.wait(3000)
         if self._stt_worker is not None and self._stt_worker.isRunning():
             self._stt_worker.wait(3000)
         if self._todo_parse_worker is not None and self._todo_parse_worker.isRunning():
