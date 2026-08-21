@@ -202,6 +202,7 @@ class MaidPet(QWidget):
         self.voice_bar.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         self.voice_bar.setMinimumHeight(self._input_min_h)
         self.voice_bar.hide()
+        self._voice_ui_active = False
         self.voice_bar.setStyleSheet(
             "QLabel {"
             "  background: rgba(255, 107, 107, 0.14);"
@@ -948,13 +949,25 @@ class MaidPet(QWidget):
         ) % (bg, hover)
 
     def _show_voice_bar(self, text="正在听…"):
+        self._voice_ui_active = True
         self.input_edit.hide()
         self.voice_bar.setText(text)
         self.voice_bar.show()
+        # 即使用户平时隐藏输入框，录音和识别状态也需要临时可见。
+        self._sync_input_row_visibility()
+        self.adjustSize()
 
     def _hide_voice_bar(self):
+        self._voice_ui_active = False
         self.voice_bar.hide()
         self.input_edit.show()
+        self._sync_input_row_visibility()
+        self.adjustSize()
+
+    def _sync_input_row_visibility(self):
+        """按用户偏好显示输入区；语音活动期间强制显示状态条。"""
+        show_input = self.settings.get("show_input", True)
+        self.input_row.setVisible(bool(show_input or self._voice_ui_active))
 
     def _start_recording(self):
         if not getattr(self, "_mic_available", True):
@@ -1266,7 +1279,10 @@ class MaidPet(QWidget):
         act_top.triggered.connect(self.toggle_on_top)
         menu.addAction(act_top)
 
-        act_input = QAction("隐藏输入框" if self.input_row.isVisible() else "显示输入框", self)
+        act_input = QAction(
+            "隐藏输入框" if self.settings.get("show_input", True) else "显示输入框",
+            self,
+        )
         act_input.triggered.connect(self.toggle_input)
         menu.addAction(act_input)
 
@@ -1357,10 +1373,15 @@ class MaidPet(QWidget):
         self.show()
 
     def toggle_input(self):
-        vis = not self.input_row.isVisible()
-        self.input_row.setVisible(vis)
-        self.settings.set("show_input", vis)
+        # 不使用控件当前可见性：语音期间输入区可能只是被临时显示。
+        show_input = not self.settings.get("show_input", True)
+        self.settings.set("show_input", show_input)
+        self._sync_input_row_visibility()
         self.adjustSize()
+        # 输入区高度变化不应影响独立的对话气泡。
+        if self.bubble.isVisible():
+            self._position_bubble()
+            self.bubble.raise_()
 
     def toggle_mute(self):
         self.settings.set("mute_anim", not self.settings.get("mute_anim", False))
