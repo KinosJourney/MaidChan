@@ -30,7 +30,34 @@ python oc.py
 该脚本会创建 `.venv` 并安装 PySide6、PyInstaller 等依赖。通常只需执行一次；
 修改普通 Python 代码时不用重新安装依赖。
 
-## 三、重新打包
+## 三、推荐：Push 后自动打包并替换
+
+先提交全部修改，然后不要直接运行 `git push`，改为：
+
+```bash
+bash ./push-and-package.sh
+```
+
+脚本会依次执行：
+
+1. 检查工作区是否干净，避免打包未提交的代码；
+2. Push 当前分支；
+3. Push 成功后打包 `Maid-chan.app`；
+4. 验证新应用签名；
+5. 安全替换 `~/Applications/Maid-chan.app`；
+6. 更新 Spotlight 索引并启动最新版。
+
+如果 Push 或打包失败，已安装的旧版本不会被替换。需要指定远端或分支时，
+可以像 `git push` 一样传入参数：
+
+```bash
+bash ./push-and-package.sh origin main
+```
+
+> Git 本身没有客户端 `post-push` 钩子，因此以后需要用这个脚本代替直接执行
+> `git push`，才能确保 Push 成功后自动打包。
+
+## 四、手动重新打包
 
 先从桌宠右键菜单选择“退出”，避免旧版本仍在运行，然后在项目目录执行：
 
@@ -45,7 +72,7 @@ PYINSTALLER_CONFIG_DIR="$PWD/.pyinstaller-cache" bash ./pack.command
 - `dist/Maid-chan.app`：可以直接运行的 macOS 应用；
 - `dist/Maid-chan-macOS.zip`：用于备份或分发的压缩包。
 
-## 四、安装或更新应用
+## 五、安装或更新应用
 
 ### 使用 Finder
 
@@ -79,7 +106,7 @@ mdimport "$HOME/Applications/Maid-chan.app"
 
 安装后按 `Command + 空格`，搜索 `Maid-chan` 即可启动。
 
-## 五、API 配置和用户数据
+## 六、API 配置和用户数据
 
 本机已经配置过 API Key 时，重新打包和替换应用不需要再次配置。
 
@@ -106,7 +133,7 @@ install -m 600 ".env" "$HOME/Library/Application Support/MaidChan/.env"
 
 因此重新打包、删除旧 `.app` 或安装新版本不会清除这些数据。
 
-## 六、哪些修改需要重新打包
+## 七、哪些修改需要重新打包
 
 需要重新打包：
 
@@ -121,7 +148,7 @@ install -m 600 ".env" "$HOME/Library/Application Support/MaidChan/.env"
 - 仅修改用户数据目录中的 `.env`；
 - 开发阶段只想运行和测试源码。
 
-## 七、验证安装结果
+## 八、验证安装结果
 
 检查 Spotlight 是否已经索引：
 
@@ -141,7 +168,7 @@ mdfind "kMDItemFSName == 'Maid-chan.app'"
 open "$HOME/Applications/Maid-chan.app"
 ```
 
-## 八、常见问题
+## 九、常见问题
 
 ### Spotlight 搜到的还是旧版本
 
@@ -158,7 +185,7 @@ mdimport "$HOME/Applications/Maid-chan.app"
 
 ### 打包时出现 PyInstaller 缓存错误
 
-使用本文第三节带 `PYINSTALLER_CONFIG_DIR` 的命令重新打包，不要直接复用损坏的
+使用本文第四节带 `PYINSTALLER_CONFIG_DIR` 的命令重新打包，不要直接复用损坏的
 系统缓存。
 
 ### 换到另一台 Mac 无法运行
