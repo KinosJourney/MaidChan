@@ -392,9 +392,10 @@ class PomodoroDialog(QDialog):
         self._status_label.setText("已暂停 %02d:%02d" % (mm, ss))
 
     def skip_rest(self):
-        """跳过当前休息倒计时。"""
+        """跳过当前休息倒计时，并立即开始下一轮专注。"""
         if self._running and self._is_resting:
             self._cancel()
+            self._start()
 
     # ---- 音效 ----
 
