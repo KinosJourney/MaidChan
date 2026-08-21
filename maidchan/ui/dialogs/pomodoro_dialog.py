@@ -318,8 +318,11 @@ class PomodoroDialog(QDialog):
     def _prompt_rest(self):
         rest_minutes = self._rest_spin.value()
         dlg = _RestPromptDialog(rest_minutes, parent=self)
-        if dlg.exec() == QDialog.Accepted:
+        result = dlg.exec()
+        if result == QDialog.Accepted:
             self._start_rest()
+        elif result == _RestPromptDialog.SKIP_REST:
+            self._start()
 
     def _start_rest(self):
         minutes = self._rest_spin.value()
@@ -448,10 +451,12 @@ class PomodoroDialog(QDialog):
 class _RestPromptDialog(QDialog):
     """番茄完成后询问是否休息的粉色风格弹窗。"""
 
+    SKIP_REST = 2
+
     def __init__(self, rest_minutes, parent=None):
         super().__init__(parent)
         self.setWindowTitle("番茄钟")
-        self.setFixedSize(300, 190)
+        self.setFixedSize(420, 190)
         self.setWindowFlags(
             Qt.Dialog
             | Qt.FramelessWindowHint
@@ -496,24 +501,45 @@ class _RestPromptDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(12)
 
-        skip_btn = QPushButton("不用了")
-        skip_btn.setCursor(Qt.PointingHandCursor)
-        skip_btn.setStyleSheet(
+        exit_btn = QPushButton("退出番茄钟模式")
+        exit_btn.setCursor(Qt.PointingHandCursor)
+        exit_btn.setStyleSheet(
             "QPushButton {"
             "  background: #f0e6ea; color: #8a6a73; border: none;"
-            "  border-radius: 14px; padding: 8px 20px; font-size: 14px;"
+            "  border-radius: 14px; padding: 8px 12px; font-size: 13px;"
             "  font-weight: bold;"
             "}"
             "QPushButton:hover { background: #e6d8de; }"
         )
-        skip_btn.clicked.connect(self.reject)
+        exit_btn.clicked.connect(self.reject)
+
+        skip_btn = QPushButton("跳过休息")
+        skip_btn.setCursor(Qt.PointingHandCursor)
+        skip_btn.setStyleSheet(
+            "QPushButton {"
+            "  background: #fff0f3; color: #e85d75;"
+            "  border: 1px solid #ffb7c5;"
+            "  border-radius: 14px; padding: 8px 12px; font-size: 13px;"
+            "  font-weight: bold;"
+            "}"
+            "QPushButton:hover { background: #ffe0e6; }"
+        )
+        skip_btn.clicked.connect(lambda: self.done(self.SKIP_REST))
 
         rest_btn = QPushButton("开始休息")
         rest_btn.setCursor(Qt.PointingHandCursor)
-        rest_btn.setStyleSheet(_BTN_STYLE_ACTIVE)
+        rest_btn.setStyleSheet(
+            "QPushButton {"
+            "  background: #ffb7c5; color: white; border: none;"
+            "  border-radius: 14px; padding: 8px 12px; font-size: 13px;"
+            "  font-weight: bold;"
+            "}"
+            "QPushButton:hover { background: #ff9db0; }"
+        )
         rest_btn.clicked.connect(self.accept)
         rest_btn.setDefault(True)
 
+        btn_row.addWidget(exit_btn, 1)
         btn_row.addWidget(skip_btn, 1)
         btn_row.addWidget(rest_btn, 1)
         body.addLayout(btn_row)

@@ -47,6 +47,20 @@ def user_data_dir():
 
 
 DATA_DIR = user_data_dir()
+
+
+def env_file_candidates(app_dir=None):
+    """按优先级返回可能的 .env 路径。
+
+    开发模式沿用项目根目录；打包版优先读取用户数据目录，避免把 API Key
+    放进应用包而导致签名失效或随应用一起分发。
+    """
+    app_env = os.path.join(app_dir or app_base_dir(), ".env")
+    if getattr(sys, "frozen", False):
+        return [os.path.join(DATA_DIR, ".env"), app_env]
+    return [app_env]
+
+
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 PROFILE_PATH = os.path.join(DATA_DIR, "profile.json")
 HISTORY_PATH = os.path.join(DATA_DIR, "history.json")

@@ -12,7 +12,7 @@ import wave
 
 from PySide6.QtCore import QThread, Signal
 
-from ..config.paths import app_base_dir
+from ..config.paths import app_base_dir, env_file_candidates
 
 try:
     import requests
@@ -38,16 +38,17 @@ def _get_session():
 
 def _read_env_file():
     """读取 .env 文件，返回 {name: value} 字典。"""
-    env_path = os.path.join(app_base_dir(), ".env")
     result = {}
-    try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                name, sep, value = line.strip().partition("=")
-                if sep and name.strip():
-                    result[name.strip()] = value.strip().strip("\"'")
-    except OSError:
-        pass
+    for env_path in env_file_candidates(app_base_dir()):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    name, sep, value = line.strip().partition("=")
+                    if sep and name.strip():
+                        result[name.strip()] = value.strip().strip("\"'")
+            break
+        except OSError:
+            continue
     return result
 
 
