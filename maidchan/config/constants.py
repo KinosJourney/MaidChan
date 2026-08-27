@@ -70,6 +70,26 @@ DEFAULT_STT_MODEL = "whisper-1"
 DEFAULT_STT_LANGUAGE = "zh"
 MAX_RECORDING_SECONDS = 60
 
+# 语音朗读（TTS）：系统语音或独立部署的角色声线服务。默认关闭，避免首次升级突然出声。
+TTS_ENABLED_DEFAULT = False
+TTS_VOLUME_DEFAULT = 0.85   # 0.0~1.0
+TTS_RATE_DEFAULT = 0.0      # -1.0~1.0，0 为系统默认语速
+# 朗读语言："ja" 用日语音色（回复会额外产出一句日语）；"zh" 直接念气泡中文。
+TTS_LANG_DEFAULT = "ja"
+# 音色（系统语音名，如 Kyoko / Tingting）；空表示用该语言的默认音色。
+TTS_VOICE_DEFAULT = ""
+# 后端："system" / "gpt-sovits" / "cosyvoice"。
+TTS_PROVIDER_DEFAULT = "system"
+TTS_API_URL_DEFAULTS = {
+    "gpt-sovits": "http://127.0.0.1:9880",
+    "cosyvoice": "http://127.0.0.1:50000",
+}
+# GPT-SoVITS 将参考音频路径原样交给服务端；CosyVoice 会从本机读取并上传。
+TTS_REF_AUDIO_DEFAULT = ""
+TTS_REF_TEXT_DEFAULT = ""
+TTS_PROMPT_LANG_DEFAULT = "ja"
+TTS_HTTP_TIMEOUT_SECONDS = 30
+
 # 待办提醒
 REMINDER_ADVANCE_MINUTES = 2          # 到点前多少分钟先提醒一次
 REMINDER_SCAN_INTERVAL_SECONDS = 20   # 后台扫描待办的间隔（越小越及时，也越耗时）

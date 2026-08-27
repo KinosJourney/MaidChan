@@ -36,7 +36,12 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
-from ..audio import AudioRecorder, SpeechRecognizeWorker, get_stt_env_config
+from ..audio import (
+    AudioRecorder,
+    SpeechRecognizeWorker,
+    TtsPlayer,
+    get_stt_env_config,
+)
 from ..config.constants import (
     CHARACTER_HEIGHT,
     CONTENT_FEED_SOURCES,
@@ -87,6 +92,7 @@ from ..llm.memory_retriever import (
 )
 from ..llm.messages import build_chat_messages
 from ..llm.todo_extractor import TodoParseWorker
+from ..llm.translator import TranslateWorker
 from ..playlist import (
     GlobalHotkey,
     PlaylistWorker,
@@ -113,7 +119,7 @@ from .dialogs import (
 from .image_loader import pixmap_from_image_dewhite
 from .macos_window import show_on_all_spaces
 from .speech_bubble import SpeechBubble
-from .text_utils import split_sentences
+from .text_utils import split_display_and_speech, split_sentences
 
 
 def _todo_log(msg):
@@ -259,12 +265,31 @@ class MaidPet(QWidget):
             parent=self,
         )
 
+        # 语音朗读：系统语音或独立角色声线服务（默认关闭，可在设置里开启）。
+        self.tts = TtsPlayer(
+            self,
+            enabled=self.settings.get("tts_enabled", False),
+            volume=self.settings.get("tts_volume", 0.85),
+            rate=self.settings.get("tts_rate", 0.0),
+            lang=self.settings.get("tts_lang", "ja"),
+            voice=self.settings.get("tts_voice", ""),
+            provider=self.settings.get("tts_provider", "system"),
+            api_url=self.settings.get("tts_api_url", ""),
+            ref_audio=self.settings.get("tts_ref_audio", ""),
+            ref_text=self.settings.get("tts_ref_text", ""),
+            prompt_lang=self.settings.get("tts_prompt_lang", "ja"),
+        )
+        # 日语朗读：中文回复经后台翻译再朗读。seq 用于丢弃过期译文（新消息已接管）。
+        self._tts_translate_worker = None
+        self._tts_seq = 0
+
         # 通知管理器：统一说话通道；气泡回调统一转发给状态机。
         self.notifications = NotificationManager(
             bubble=self.bubble,
             split_fn=split_sentences,
             position_cb=self._position_bubble,
             state_machine=self.state,
+            tts=self.tts,
             parent=self,
         )
 
@@ -516,13 +541,15 @@ class MaidPet(QWidget):
 
     def _on_reply(self, content):
         self._set_action_busy(False)
-        self.history.add("maid", content)
-        self.say(content)
+        # 兼容模型偶尔附带的 [JA] 行；正常情况下 display 即完整中文回复。
+        display, _ = split_display_and_speech(content)
+        self.history.add("maid", display)
+        self.say(display)
         # 标记被召回的记忆
         for m in self._current_memories:
             self.memory.mark_recalled(m.get("id"))
         # 后台提取新记忆
-        self._extract_memory(self._last_user_msg, content)
+        self._extract_memory(self._last_user_msg, display)
 
     def _on_reply_failed(self, err):
         self._set_action_busy(False)
@@ -573,11 +600,56 @@ class MaidPet(QWidget):
 
     # ---- 本地说话（不走 API，不记历史） ----
     def show_local(self, text):
-        self.notifications.show(text, record=False)
+        # 中文模式朗读中文；日语模式下本地中文模板不朗读（bump seq 使旧译文失效）。
+        self._tts_seq += 1
+        self.notifications.show(
+            text, record=False, speak_text=self._sync_speech(text),
+        )
 
-    def say(self, text, record=False, priority=0, link=None):
-        # 说话通道统一走通知管理器；嘴巴 / 眨眼由状态机决定。
-        self.notifications.show(text, record=record, priority=priority, link=link)
+    def say(self, text, record=False, priority=0, link=None, speak_source=None):
+        """说话通道统一走通知管理器；嘴巴 / 眨眼由状态机决定。
+
+        ``speak_source`` 是用于朗读的中文原文（默认取 ``text``，供带🔍提示的
+        主动陪聊传入不含提示的正文）。中文模式同步朗读；日语模式后台翻译后朗读。
+        """
+        self._tts_seq += 1
+        src = speak_source if speak_source is not None else text
+        self.notifications.show(
+            text, record=record, priority=priority, link=link,
+            speak_text=self._sync_speech(src),
+        )
+        if self._ja_speech_on() and src.strip():
+            self._translate_and_speak(src, self._tts_seq)
+
+    # ---- 朗读辅助 ----
+    def _tts_on(self):
+        return bool(
+            self.settings.get("tts_enabled", False) and self.tts.is_available()
+        )
+
+    def _ja_speech_on(self):
+        return self._tts_on() and self.settings.get("tts_lang", "ja") == "ja"
+
+    def _sync_speech(self, text):
+        """中文模式下同步朗读的文本；其它情况返回 None（日语走异步翻译）。"""
+        if self._tts_on() and self.settings.get("tts_lang", "ja") == "zh":
+            return text
+        return None
+
+    def _translate_and_speak(self, text, seq):
+        """后台把中文翻成日语，翻好后若仍是最新一句则朗读。"""
+        worker = TranslateWorker(text, self)
+        self._tts_translate_worker = worker
+        worker.translated.connect(lambda jp, s=seq: self._on_translated(jp, s))
+        worker.failed.connect(lambda _err: None)  # 翻译失败静默，不影响气泡
+        worker.start()
+
+    def _on_translated(self, japanese, seq):
+        # 已被更新的消息取代则丢弃，避免念出过期内容。
+        if seq != self._tts_seq:
+            return
+        if japanese and japanese.strip():
+            self.tts.speak(japanese)
 
     def _chat_busy(self):
         """是否正忙（对话中 / 录音 / 识别中 / 气泡显示中），用于主动陪聊门控。"""
@@ -688,6 +760,9 @@ class MaidPet(QWidget):
         item = pending.get("item")
         priority = pending.get("priority", 0)
 
+        # 兼容模型偶尔附带的 [JA] 行。
+        content, _ = split_display_and_speech(content)
+
         display = content
         record = content
         link = None
@@ -701,7 +776,8 @@ class MaidPet(QWidget):
                 content, source, (item.get("link") or "").strip() or link,
             )
         self.history.add("maid", record)
-        self.say(display, priority=priority, link=link)
+        # 朗读正文（不含🔍提示行）：中文模式同步、日语模式后台翻译。
+        self.say(display, priority=priority, link=link, speak_source=content)
 
     def _topic_link(self, item):
         """点击气泡要打开的链接：RSS 用原文链接，本地话题用搜索引擎查证。"""
@@ -990,6 +1066,8 @@ class MaidPet(QWidget):
         if self._stt_worker and self._stt_worker.isRunning():
             self.show_local("语音正在识别中，请稍等～")
             return
+        # 录音前停掉正在朗读的语音，避免麦克风录进 Maid 自己的声音。
+        self.tts.stop()
         if self._recorder.start():
             self._recording_start = time.time()
             self._audio_levels = []
@@ -1094,7 +1172,11 @@ class MaidPet(QWidget):
     # ===================== 待办提醒 =====================
     def _remind(self, text, priority=REMINDER_PRIORITY):
         """提醒服务的通知回调：走高优先级气泡，不被普通闲聊顶掉。"""
-        self.notifications.show(text, priority=priority)
+        # 提醒是中文模板：中文模式下朗读，日语模式下不念（避免日语音色读中文）。
+        self._tts_seq += 1
+        self.notifications.show(
+            text, priority=priority, speak_text=self._sync_speech(text),
+        )
 
     def _maybe_parse_todo(self, text):
         """在后台判断语音是否为待办，不阻塞或控制聊天消息发送。"""
@@ -1363,6 +1445,14 @@ class MaidPet(QWidget):
         act_mute.triggered.connect(self.toggle_mute)
         menu.addAction(act_mute)
 
+        if self.tts.is_available():
+            act_tts = QAction(
+                "关闭语音朗读" if self.settings.get("tts_enabled", False) else "开启语音朗读",
+                self,
+            )
+            act_tts.triggered.connect(self.toggle_tts)
+            menu.addAction(act_tts)
+
         if sys.platform == "darwin":
             autostart_on = self._is_autostart_enabled()
             act_autostart = QAction(
@@ -1406,12 +1496,37 @@ class MaidPet(QWidget):
             self.settings,
             on_saved=self._on_settings_saved,
             on_test_proactive=self._test_proactive_chat,
+            on_preview_tts=self._preview_tts,
+            tts_available=self.tts.is_available(),
+            voices_getter=self.tts.available_voice_names,
             parent=self,
         )
         self._place_dialog_on_screen(dlg)
         dlg.exec()
 
+    def _preview_tts(self, config):
+        """设置面板『试听』：使用当前尚未保存的完整 Provider 配置。"""
+        lang = config.get("lang", "ja")
+        if lang == "zh":
+            sample = "你好，主人，我是 Maid，很高兴为你服务～"
+        else:
+            sample = "こんにちは、ご主人様。メイドです、よろしくお願いします。"
+        self.tts.preview(sample, **config)
+
     def _on_settings_saved(self, prompt_changed=True):
+        # 语音朗读设置即时生效；切换 Provider 时门面会安全重建后端。
+        self.tts.apply_settings(
+            enabled=self.settings.get("tts_enabled", False),
+            volume=self.settings.get("tts_volume", 0.85),
+            rate=self.settings.get("tts_rate", 0.0),
+            lang=self.settings.get("tts_lang", "ja"),
+            voice=self.settings.get("tts_voice", ""),
+            provider=self.settings.get("tts_provider", "system"),
+            api_url=self.settings.get("tts_api_url", ""),
+            ref_audio=self.settings.get("tts_ref_audio", ""),
+            ref_text=self.settings.get("tts_ref_text", ""),
+            prompt_lang=self.settings.get("tts_prompt_lang", "ja"),
+        )
         if prompt_changed:
             # 立即更新内存 prompt，并重置短期上下文（清空发给 API 的历史）
             self.system_prompt = self.settings.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
@@ -1458,6 +1573,17 @@ class MaidPet(QWidget):
 
     def toggle_mute(self):
         self.settings.set("mute_anim", not self.settings.get("mute_anim", False))
+
+    def toggle_tts(self):
+        new_val = not self.settings.get("tts_enabled", False)
+        self.settings.set("tts_enabled", new_val)
+        self.tts.set_enabled(new_val)
+        if new_val:
+            lang = self.settings.get("tts_lang", "ja")
+            tip = "接下来我会用日语念给你听～" if lang == "ja" else "接下来我会念给你听～"
+            self.show_local("语音朗读已开启，%s" % tip)
+        else:
+            self.show_local("语音朗读已关闭。")
 
     # ===================== 开机启动（macOS LaunchAgent） =====================
 
@@ -1545,6 +1671,7 @@ class MaidPet(QWidget):
     def _teardown(self):
         """统一清理：停止全部定时任务、等待后台请求结束、关闭气泡。"""
         self.scheduler.shutdown()
+        self.tts.shutdown()
         if self._recorder.is_recording:
             self._recorder.cancel()
         if self._global_hotkey is not None:
@@ -1563,6 +1690,9 @@ class MaidPet(QWidget):
             self._todo_parse_worker.wait(3000)
         if self._content_worker is not None and self._content_worker.isRunning():
             self._content_worker.wait(3000)
+        if (self._tts_translate_worker is not None
+                and self._tts_translate_worker.isRunning()):
+            self._tts_translate_worker.wait(3000)
         if self._todo_list_dialog is not None:
             self._todo_list_dialog.close()
         self._pomodoro_dialog.close()

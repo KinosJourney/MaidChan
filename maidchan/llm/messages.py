@@ -12,7 +12,6 @@ ANTI_FABRICATION_GUARD = (
     "还不了解，或者自然地问主人，而不是杜撰。）"
 )
 
-
 def build_chat_messages(system_prompt, profile, history, memories=None,
                         max_context_turns=MAX_CONTEXT_TURNS):
     """构造 OpenAI 格式的 messages 列表。

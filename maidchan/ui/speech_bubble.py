@@ -36,12 +36,19 @@ class SpeechBubble(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        flags = Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+        flags = (
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus
+        )
         # macOS 的 Qt.Tool 窗口会在应用失去焦点时隐藏。
         if sys.platform != "darwin":
             flags |= Qt.Tool
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        # 主动对话可能在用户操作其它应用时弹出。顶层窗口默认会激活应用并
+        # 抢走键盘焦点；明确要求只显示、不激活，鼠标点击气泡仍然可用。
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
 
         self.label = QLabel(self)
         self.label.setWordWrap(True)
