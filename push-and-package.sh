@@ -52,16 +52,10 @@ fi
 
 export PYINSTALLER_CONFIG_DIR="$PWD/.pyinstaller-cache"
 
-if ! .venv/bin/python -m PyInstaller \
-    --noconfirm \
-    --windowed \
-    --name "Maid-chan" \
-    --osx-bundle-identifier "com.maidchan.desktop" \
-    --icon "pic/app-icon.png" \
-    --collect-submodules maidchan \
-    --add-data "pic:pic" \
-    --add-data "readme.md:." \
-    oc.py; then
+# 使用 Maid-chan.spec 打包（spec 内已配置：麦克风权限声明、.icns 图标、
+# bundle id、附带 pic/readme 等）。切勿改回命令行 --name 方式，否则会覆盖
+# spec 并丢失麦克风声明，导致打包后的 App 无法收音。
+if ! .venv/bin/python -m PyInstaller --noconfirm Maid-chan.spec; then
     echo ""
     echo "[停止] 打包失败；已安装的旧版本保持不变。"
     exit 1

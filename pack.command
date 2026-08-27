@@ -26,17 +26,10 @@ python -m pip install --upgrade pyinstaller >/dev/null 2>&1
 echo "正在打包，请稍候（首次打包较慢）…"
 echo ""
 
-# --windowed 让 app 没有终端黑窗；--add-data 携带图片与 readme
-# --collect-submodules maidchan 确保拆分后的所有子模块都被打包进去
-python -m PyInstaller \
-    --noconfirm \
-    --windowed \
-    --name "Maid-chan" \
-    --icon "pic/app-icon.png" \
-    --collect-submodules maidchan \
-    --add-data "pic:pic" \
-    --add-data "readme.md:." \
-    oc.py
+# 使用 Maid-chan.spec 打包（spec 内已配置：麦克风权限声明、.icns 图标、
+# bundle id、附带 pic/readme 等）。切勿改回命令行 --name 方式，否则会覆盖
+# spec 并丢失麦克风声明，导致打包后的 App 无法收音。
+python -m PyInstaller --noconfirm Maid-chan.spec
 
 if [ $? -ne 0 ]; then
     echo ""
