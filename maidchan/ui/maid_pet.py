@@ -544,7 +544,7 @@ class MaidPet(QWidget):
         # 兼容模型偶尔附带的 [JA] 行；正常情况下 display 即完整中文回复。
         display, _ = split_display_and_speech(content)
         self.history.add("maid", display)
-        self.say(display)
+        self.say(display, speak=True)
         # 标记被召回的记忆
         for m in self._current_memories:
             self.memory.mark_recalled(m.get("id"))
@@ -600,25 +600,25 @@ class MaidPet(QWidget):
 
     # ---- 本地说话（不走 API，不记历史） ----
     def show_local(self, text):
-        # 中文模式朗读中文；日语模式下本地中文模板不朗读（bump seq 使旧译文失效）。
+        # 本地状态提示、启动问候和空闲提示只显示气泡，不主动打扰用户。
         self._tts_seq += 1
-        self.notifications.show(
-            text, record=False, speak_text=self._sync_speech(text),
-        )
+        self.notifications.show(text, record=False)
 
-    def say(self, text, record=False, priority=0, link=None, speak_source=None):
+    def say(self, text, record=False, priority=0, link=None, speak_source=None,
+            speak=False):
         """说话通道统一走通知管理器；嘴巴 / 眨眼由状态机决定。
 
         ``speak_source`` 是用于朗读的中文原文（默认取 ``text``，供带🔍提示的
-        主动陪聊传入不含提示的正文）。中文模式同步朗读；日语模式后台翻译后朗读。
+        内容传入不含提示的正文）。只有 ``speak=True`` 的用户交互回复才会朗读；
+        中文模式同步朗读，日语模式后台翻译后朗读。
         """
         self._tts_seq += 1
         src = speak_source if speak_source is not None else text
         self.notifications.show(
             text, record=record, priority=priority, link=link,
-            speak_text=self._sync_speech(src),
+            speak_text=self._sync_speech(src) if speak else None,
         )
-        if self._ja_speech_on() and src.strip():
+        if speak and self._ja_speech_on() and src.strip():
             self._translate_and_speak(src, self._tts_seq)
 
     # ---- 朗读辅助 ----
@@ -683,16 +683,16 @@ class MaidPet(QWidget):
         if self._is_replying():
             self.show_local("稍等，我还在想上一句呢～")
             return
-        self._begin_topic(category=None, item=None, priority=0)
+        self._begin_topic(category=None, item=None, priority=0, speak=True)
 
     def _trigger_proactive_chat(self, category, item):
         """主动陪聊服务的回调：就一条内容找主人聊。成功启动返回 True。"""
         if self._is_replying():
             return False
         return self._begin_topic(category=category, item=item,
-                                 priority=PROACTIVE_CHAT_PRIORITY)
+                                 priority=PROACTIVE_CHAT_PRIORITY, speak=False)
 
-    def _begin_topic(self, category, item, priority):
+    def _begin_topic(self, category, item, priority, speak=False):
         """构建主动话题的 messages 并发起 LLM 请求。"""
         self.last_active = time.time()
         # 主动聊天已接管这一轮空闲陪伴，避免本地 idle 提示再叠加。
@@ -713,7 +713,11 @@ class MaidPet(QWidget):
 
         if item is not None:
             self.content_cache.mark_used(item)
-        self._pending_topic = {"item": item, "priority": priority}
+        self._pending_topic = {
+            "item": item,
+            "priority": priority,
+            "speak": speak,
+        }
 
         self._set_action_busy(True)
         self.state.begin_thinking()
@@ -759,6 +763,7 @@ class MaidPet(QWidget):
         self._pending_topic = None
         item = pending.get("item")
         priority = pending.get("priority", 0)
+        speak = pending.get("speak", False)
 
         # 兼容模型偶尔附带的 [JA] 行。
         content, _ = split_display_and_speech(content)
@@ -776,8 +781,11 @@ class MaidPet(QWidget):
                 content, source, (item.get("link") or "").strip() or link,
             )
         self.history.add("maid", record)
-        # 朗读正文（不含🔍提示行）：中文模式同步、日语模式后台翻译。
-        self.say(display, priority=priority, link=link, speak_source=content)
+        # 手动发起的话题可朗读；自动陪聊只显示气泡，避免突然出声。
+        self.say(
+            display, priority=priority, link=link, speak_source=content,
+            speak=speak,
+        )
 
     def _topic_link(self, item):
         """点击气泡要打开的链接：RSS 用原文链接，本地话题用搜索引擎查证。"""
@@ -1172,11 +1180,9 @@ class MaidPet(QWidget):
     # ===================== 待办提醒 =====================
     def _remind(self, text, priority=REMINDER_PRIORITY):
         """提醒服务的通知回调：走高优先级气泡，不被普通闲聊顶掉。"""
-        # 提醒是中文模板：中文模式下朗读，日语模式下不念（避免日语音色读中文）。
+        # 提醒只显示气泡和提示音，不额外朗读。
         self._tts_seq += 1
-        self.notifications.show(
-            text, priority=priority, speak_text=self._sync_speech(text),
-        )
+        self.notifications.show(text, priority=priority)
 
     def _maybe_parse_todo(self, text):
         """在后台判断语音是否为待办，不阻塞或控制聊天消息发送。"""
