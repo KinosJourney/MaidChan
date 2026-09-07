@@ -69,6 +69,8 @@ DEFAULT_STT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_STT_MODEL = "whisper-1"
 DEFAULT_STT_LANGUAGE = "zh"
 MAX_RECORDING_SECONDS = 60
+# 识别请求卡住时，界面最多等这么久就提示超时（毫秒）。
+STT_UI_WATCHDOG_MS = 40000
 
 # 语音朗读（TTS）：系统语音或独立部署的角色声线服务。默认关闭，避免首次升级突然出声。
 TTS_ENABLED_DEFAULT = False

@@ -258,6 +258,24 @@ class PomodoroDialog(QDialog):
         if not self._running:
             self._rest_spin.setValue(minutes)
 
+    def start_focus(self, minutes=None, rest_minutes=None):
+        """程序化开始一轮专注。已在运行时返回 False，不重启。"""
+        if self._running:
+            return False
+        if minutes is not None:
+            self._spin.setValue(int(minutes))
+        if rest_minutes is not None:
+            self._rest_spin.setValue(int(rest_minutes))
+        self._start()
+        return True
+
+    def cancel_session(self):
+        """取消当前专注或休息。未在运行时返回 False。"""
+        if not self._running:
+            return False
+        self._cancel()
+        return True
+
     def _toggle(self):
         if self._running:
             self._cancel()
@@ -434,6 +452,14 @@ class PomodoroDialog(QDialog):
     @property
     def is_paused(self):
         return self._paused
+
+    @property
+    def focus_minutes(self):
+        return self._spin.value()
+
+    @property
+    def rest_minutes(self):
+        return self._rest_spin.value()
 
     def closeEvent(self, event):
         if self._running:

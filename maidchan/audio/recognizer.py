@@ -8,6 +8,7 @@
 import io
 import os
 import struct
+import time
 import wave
 
 from PySide6.QtCore import QThread, Signal
@@ -22,18 +23,28 @@ except ImportError:
     HTTPAdapter = None
 
 
-# 复用连接池，避免每次请求重新建立 TCP/TLS
-_session = None
+# 硅基流动文档：503/504 多为服务端瞬时过载，稍后重试即可。
+_RETRY_STATUS = (503, 504)
+_MAX_ATTEMPTS = 2
+_RETRY_BASE_SEC = 0.4
+# 实测经系统代理到硅基流动，单次约 15 秒，读超时要给足余量。
+_CONNECT_TIMEOUT_SEC = 10
+_READ_TIMEOUT_SEC = 30
 
 
 def _get_session():
-    global _session
-    if _session is None and requests is not None:
-        _session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=1, pool_maxsize=2)
-        _session.mount("https://", adapter)
-        _session.mount("http://", adapter)
-    return _session
+    """每次识别用独立 Session，避免复用卡住的连接。
+
+    保留 ``trust_env=True``（默认）：这台机器必须经系统代理才能
+    稳定连硅基流动，直连会读超时。
+    """
+    if requests is None:
+        return None
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1, max_retries=0)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 def _read_env_file():
@@ -131,6 +142,18 @@ class SpeechRecognizeWorker(QThread):
         self.api_key = api_key
         self.model = model
         self.language = language
+        self._session = None
+        self._aborted = False
+
+    def abort(self):
+        """界面看门狗超时后打断卡住的 HTTP 请求。"""
+        self._aborted = True
+        session = self._session
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
 
     def run(self):
         if requests is None:
@@ -160,16 +183,39 @@ class SpeechRecognizeWorker(QThread):
         if self.language:
             files["language"] = (None, self.language)
 
+        session = _get_session()
+        if session is None:
+            self.failed.emit("缺少 requests 库，请先运行 install 脚本安装依赖。")
+            return
+        self._session = session
         try:
-            session = _get_session()
-            resp = session.post(
-                url, headers=headers, files=files, timeout=(5, 20),
-            )
+            resp = None
+            for attempt in range(_MAX_ATTEMPTS):
+                if self._aborted:
+                    return
+                resp = session.post(
+                    url,
+                    headers=headers,
+                    files=files,
+                    timeout=(_CONNECT_TIMEOUT_SEC, _READ_TIMEOUT_SEC),
+                )
+                if resp.status_code not in _RETRY_STATUS:
+                    break
+                if attempt < _MAX_ATTEMPTS - 1:
+                    time.sleep(_RETRY_BASE_SEC * (2 ** attempt))
+
+            if self._aborted:
+                return
             if resp.status_code == 401:
                 self.failed.emit("语音识别 API Key 无效（401），请检查配置。")
                 return
             if resp.status_code == 402:
                 self.failed.emit("语音识别账户余额不足（402），请充值。")
+                return
+            if resp.status_code in _RETRY_STATUS:
+                self.failed.emit(
+                    "语音识别服务正忙，请稍后再说一次～"
+                )
                 return
             if resp.status_code != 200:
                 self.failed.emit(
@@ -184,11 +230,21 @@ class SpeechRecognizeWorker(QThread):
             self.finished_ok.emit(text)
 
         except requests.exceptions.Timeout:
-            self.failed.emit("语音识别超时，请稍后再试～")
+            if not self._aborted:
+                self.failed.emit("语音识别超时，请稍后再试～")
         except requests.exceptions.ConnectionError:
-            self.failed.emit("无法连接语音识别服务，请检查网络。")
+            if not self._aborted:
+                self.failed.emit("无法连接语音识别服务，请检查网络。")
         except Exception as e:
-            self.failed.emit("语音识别出错：%s" % str(e)[:150])
+            if not self._aborted:
+                self.failed.emit("语音识别出错：%s" % str(e)[:150])
+        finally:
+            self._session = None
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
 
     @staticmethod
     def _extract_text(resp):

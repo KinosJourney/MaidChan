@@ -61,6 +61,7 @@ from ..config.constants import (
     PROACTIVE_CHAT_PRIORITY,
     PROACTIVE_LOCAL_POOLS,
     REMINDER_PRIORITY,
+    STT_UI_WATCHDOG_MS,
 )
 from ..config.paths import (
     CONTENT_CACHE_PATH,
@@ -82,6 +83,7 @@ from ..core import (
     Scheduler,
 )
 from ..core.content_feed import ContentRefreshWorker
+from ..core.pomodoro_command import parse_pomodoro_command
 from ..llm.client import ChatWorker
 from ..llm.memory_extractor import MemoryExtractWorker
 from ..llm.memory_retriever import (
@@ -377,6 +379,7 @@ class MaidPet(QWidget):
         self._recorder = AudioRecorder(self)
         self._recorder.error.connect(self._on_recorder_error)
         self._stt_worker = None
+        self._stt_pending = False
         self._recording_start = 0.0
         self._mic_available = AudioRecorder.is_available()
         self._refresh_action_btn()
@@ -1140,15 +1143,32 @@ class MaidPet(QWidget):
         model = self.settings.get("stt_model", "") or env_model or DEFAULT_STT_MODEL
         language = self.settings.get("stt_language", DEFAULT_STT_LANGUAGE)
 
+        self._stt_pending = True
         self._stt_worker = SpeechRecognizeWorker(
             wav_data, base_url, api_key, model, language, self,
         )
         self._stt_worker.finished_ok.connect(self._on_stt_result)
         self._stt_worker.failed.connect(self._on_stt_failed)
         self._stt_worker.start()
+        self.scheduler.schedule_once(
+            "stt_watchdog", STT_UI_WATCHDOG_MS, self._on_stt_watchdog,
+        )
         self._refresh_action_btn()
 
+    def _on_stt_watchdog(self):
+        if not self._stt_pending:
+            return
+        self._stt_pending = False
+        if self._stt_worker is not None:
+            self._stt_worker.abort()
+        self.show_local("语音识别超时，请稍后再试～")
+        self._reset_voice_ui()
+
     def _on_stt_result(self, text):
+        if not self._stt_pending:
+            return
+        self._stt_pending = False
+        self.scheduler.cancel("stt_watchdog")
         self._hide_voice_bar()
         self.input_edit.setPlainText(text)
         self.input_edit.moveCursor(QTextCursor.End)
@@ -1156,11 +1176,20 @@ class MaidPet(QWidget):
         self._adjust_input_height()
         self.scheduler.schedule_once("input_height", 50, self._adjust_input_height)
         self._reset_voice_ui()
+        # 番茄钟指令当场执行，不再当闲聊发出，也不走待办解析。
+        if self._try_pomodoro_voice_command(text):
+            self.input_edit.clear()
+            self._adjust_input_height()
+            return
         # 语音识别成功后立即发送；待办识别仅作为独立的后台附加处理。
         self.on_send()
         self._maybe_parse_todo(text)
 
     def _on_stt_failed(self, err):
+        if not self._stt_pending:
+            return
+        self._stt_pending = False
+        self.scheduler.cancel("stt_watchdog")
         debug_path = os.path.join(DATA_DIR, "last_recording.wav")
         if os.path.isfile(debug_path):
             size_kb = os.path.getsize(debug_path) // 1024
@@ -1245,6 +1274,82 @@ class MaidPet(QWidget):
     def open_pomodoro(self):
         self._place_dialog_on_screen(self._pomodoro_dialog)
         self._pomodoro_dialog.show_and_raise()
+
+    def _try_pomodoro_voice_command(self, text):
+        """命中语音番茄钟指令则执行并回本地气泡，返回 True。"""
+        cmd = parse_pomodoro_command(text)
+        if cmd is None:
+            return False
+        self.last_active = time.time()
+        action = cmd["action"]
+        dlg = self._pomodoro_dialog
+        name = self.profile.get("call_me") or "主人"
+
+        if action == "start":
+            if dlg.is_running:
+                if dlg.is_paused:
+                    self.show_local("番茄钟暂停着，说「继续专注」就可以接着计时～")
+                elif dlg.is_resting:
+                    self.show_local("正在休息呢，说「跳过休息」就能马上开始下一轮～")
+                else:
+                    self.show_local("已经在走番茄钟啦，说「取消番茄钟」可以停掉～")
+                return True
+            dlg.start_focus(cmd.get("minutes"), cmd.get("rest_minutes"))
+            self.show_local(
+                "好的，%s，开始 %d 分钟专注～休息是 %d 分钟。"
+                % (name, dlg.focus_minutes, dlg.rest_minutes)
+            )
+            return True
+
+        if action == "open":
+            self.open_pomodoro()
+            self.show_local("番茄钟面板打开啦，选好时长就可以开始～")
+            return True
+
+        if action == "cancel":
+            if dlg.cancel_session():
+                self.show_local("好的，番茄钟已经停掉啦～")
+            else:
+                self.show_local("现在没有在走番茄钟哦～")
+            return True
+
+        if action == "pause":
+            if not dlg.is_running:
+                self.show_local("还没有开始番茄钟呢～")
+            elif dlg.is_resting:
+                self.show_local("休息倒计时不能暂停哦，想提前结束可以说「跳过休息」～")
+            elif dlg.is_paused:
+                self.show_local("已经暂停啦，说「继续专注」就能接着计时～")
+            else:
+                dlg.toggle_pause()
+                self._refresh_pomo_control()
+                self._position_pomo_label()
+                self.show_local("好的，专注先暂停～")
+            return True
+
+        if action == "resume":
+            if not dlg.is_running:
+                self.show_local("还没有开始番茄钟呢～")
+            elif dlg.is_resting:
+                self.show_local("现在是休息时间，想提前开始可以说「跳过休息」～")
+            elif not dlg.is_paused:
+                self.show_local("现在正在计时呢～")
+            else:
+                dlg.toggle_pause()
+                self._refresh_pomo_control()
+                self._position_pomo_label()
+                self.show_local("好的，继续专注～")
+            return True
+
+        if action == "skip_rest":
+            if dlg.is_running and dlg.is_resting:
+                dlg.skip_rest()
+                self.show_local("好的，跳过休息，继续专注～")
+            else:
+                self.show_local("现在不是休息时间哦～")
+            return True
+
+        return False
 
     def _pomodoro_tick(self, time_text):
         self._pomo_label.setText(time_text)
@@ -1691,6 +1796,7 @@ class MaidPet(QWidget):
         if self._keyword_worker is not None and self._keyword_worker.isRunning():
             self._keyword_worker.wait(3000)
         if self._stt_worker is not None and self._stt_worker.isRunning():
+            self._stt_worker.abort()
             self._stt_worker.wait(3000)
         if self._todo_parse_worker is not None and self._todo_parse_worker.isRunning():
             self._todo_parse_worker.wait(3000)

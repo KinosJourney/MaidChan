@@ -17,6 +17,63 @@ try:
     _HAS_MULTIMEDIA = True
 except ImportError:
     _HAS_MULTIMEDIA = False
+    QAudioFormat = None  # noqa: N816
+
+
+# 与 QAudioFormat.SampleFormat 数值一致，转换函数不依赖 Qt 枚举。
+_SF_UINT8 = 1
+_SF_INT16 = 2
+_SF_INT32 = 3
+_SF_FLOAT = 4
+
+_COMMON_RATES = (16000, 24000, 44100, 48000, 22050, 32000, 8000, 96000)
+
+
+def _sample_format_id(sample_format):
+    """把 Qt SampleFormat 或整数统一成 1/2/3/4。
+
+    PySide6 的枚举不是 IntEnum，``int(SampleFormat.Int16)`` 会直接 TypeError。
+    """
+    if isinstance(sample_format, int):
+        return sample_format
+    value = getattr(sample_format, "value", None)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(sample_format)
+    except (TypeError, ValueError):
+        return _SF_INT16
+
+
+def _pcm_to_int16(raw, sample_format):
+    """将原始 PCM 转为交错 Int16 小端字节。"""
+    if not raw:
+        return b""
+    sf = _sample_format_id(sample_format)
+    if sf == _SF_INT16:
+        n = len(raw) - (len(raw) % 2)
+        return raw[:n] if n != len(raw) else raw
+    if sf == _SF_FLOAT:
+        n = len(raw) // 4
+        if n == 0:
+            return b""
+        values = struct.unpack("<%df" % n, raw[: n * 4])
+        samples = [
+            max(-32768, min(32767, int(v * 32767.0))) for v in values
+        ]
+        return struct.pack("<%dh" % n, *samples)
+    if sf == _SF_INT32:
+        n = len(raw) // 4
+        if n == 0:
+            return b""
+        values = struct.unpack("<%di" % n, raw[: n * 4])
+        samples = [max(-32768, min(32767, v >> 16)) for v in values]
+        return struct.pack("<%dh" % n, *samples)
+    if sf == _SF_UINT8:
+        samples = [max(-32768, min(32767, (b - 128) << 8)) for b in raw]
+        return struct.pack("<%dh" % len(samples), *samples)
+    n = len(raw) - (len(raw) % 2)
+    return raw[:n]
 
 
 class AudioRecorder(QObject):
@@ -35,9 +92,12 @@ class AudioRecorder(QObject):
         self._io_device = None
         self._poll_timer = None
         self._data = bytearray()
+        self._pending = bytearray()
         self._peak = 0.0
         self._recording = False
         self._fmt = None
+        self._frame_bytes = 2
+        self._ready_connected = False
 
     @staticmethod
     def is_available():
@@ -69,10 +129,28 @@ class AudioRecorder(QObject):
 
         self._fmt = fmt
         self._data = bytearray()
+        self._pending = bytearray()
         self._peak = 0.0
+        self._frame_bytes = max(1, fmt.bytesPerSample() * fmt.channelCount())
 
-        self._source = QAudioSource(device, fmt, self)
-        self._io_device = self._source.start()
+        self._source, self._io_device = self._open_source(device, fmt)
+        if self._io_device is None:
+            preferred = device.preferredFormat()
+            if (
+                preferred.isValid()
+                and preferred.sampleRate() > 0
+                and (
+                    preferred.sampleRate() != fmt.sampleRate()
+                    or preferred.channelCount() != fmt.channelCount()
+                    or preferred.sampleFormat() != fmt.sampleFormat()
+                )
+            ):
+                fmt = preferred
+                self._fmt = fmt
+                self._frame_bytes = max(
+                    1, fmt.bytesPerSample() * fmt.channelCount()
+                )
+                self._source, self._io_device = self._open_source(device, fmt)
 
         if self._io_device is None:
             self.error.emit("无法启动麦克风录音。")
@@ -81,6 +159,7 @@ class AudioRecorder(QObject):
 
         # 双重保障：readyRead 信号 + 定时轮询
         self._io_device.readyRead.connect(self._on_ready_read)
+        self._ready_connected = True
 
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(self._POLL_INTERVAL_MS)
@@ -122,7 +201,7 @@ class AudioRecorder(QObject):
         return 0.0
 
     def data_size(self):
-        """已录制的原始 PCM 数据大小（字节）。"""
+        """已录制的 Int16 PCM 数据大小（字节）。"""
         return len(self._data)
 
     def format_info(self):
@@ -137,6 +216,14 @@ class AudioRecorder(QObject):
 
     # ------------------------------------------------------------------
 
+    def _open_source(self, device, fmt):
+        source = QAudioSource(device, fmt, self)
+        io_device = source.start()
+        if io_device is None:
+            source.deleteLater()
+            return None, None
+        return source, io_device
+
     @Slot()
     def _on_ready_read(self):
         """从内部 QIODevice 读取所有可用的音频数据。"""
@@ -144,10 +231,7 @@ class AudioRecorder(QObject):
             return
         chunk = self._io_device.readAll()
         if chunk and len(chunk) > 0:
-            # PySide6 readAll() 返回 QByteArray，转成 bytes
-            raw = bytes(chunk)
-            self._data.extend(raw)
-            self._update_peak(raw)
+            self._append_capture(bytes(chunk))
 
     def _drain_remaining(self):
         """停止前读取残留数据。"""
@@ -156,9 +240,25 @@ class AudioRecorder(QObject):
         for _ in range(10):
             chunk = self._io_device.readAll()
             if chunk and len(chunk) > 0:
-                self._data.extend(bytes(chunk))
+                self._append_capture(bytes(chunk))
             else:
                 break
+
+    def _append_capture(self, raw):
+        """按帧对齐后转为 Int16，再写入缓冲区。"""
+        if not raw or self._fmt is None:
+            return
+        self._pending.extend(raw)
+        frame = self._frame_bytes
+        n = (len(self._pending) // frame) * frame
+        if n == 0:
+            return
+        complete = bytes(self._pending[:n])
+        del self._pending[:n]
+        pcm16 = _pcm_to_int16(complete, self._fmt.sampleFormat())
+        if pcm16:
+            self._data.extend(pcm16)
+            self._update_peak(pcm16)
 
     def _update_peak(self, chunk):
         n_samples = len(chunk) // 2
@@ -177,36 +277,79 @@ class AudioRecorder(QObject):
             self._poll_timer.stop()
             self._poll_timer.deleteLater()
             self._poll_timer = None
-        if self._io_device is not None:
+        if self._io_device is not None and getattr(self, "_ready_connected", False):
+            self._ready_connected = False
             try:
                 self._io_device.readyRead.disconnect(self._on_ready_read)
             except (RuntimeError, TypeError):
                 pass
 
     @staticmethod
+    def _make_format(rate, channels, sample_format):
+        fmt = QAudioFormat()
+        fmt.setSampleRate(rate)
+        fmt.setChannelCount(channels)
+        fmt.setSampleFormat(sample_format)
+        return fmt
+
+    @staticmethod
     def _negotiate_format(device):
-        """尝试 Int16 格式的几种常见采样率，返回设备支持的第一个。"""
-        for rate in (16000, 44100, 48000):
-            fmt = QAudioFormat()
-            fmt.setSampleRate(rate)
-            fmt.setChannelCount(1)
-            fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
-            if device.isFormatSupported(fmt):
-                return fmt
-        for rate in (44100, 48000):
-            fmt = QAudioFormat()
-            fmt.setSampleRate(rate)
-            fmt.setChannelCount(2)
-            fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
-            if device.isFormatSupported(fmt):
-                return fmt
+        """按设备真实能力选格式：优先 Int16，采样率跟麦克风走。
+
+        AirPods 等蓝牙麦常见只支持 24kHz，不能只试 16k/44.1k/48k。
+        """
+        preferred = device.preferredFormat()
+        pref_rate = preferred.sampleRate() if preferred.isValid() else 0
+        pref_ch = preferred.channelCount() if preferred.isValid() else 0
+        pref_sf = preferred.sampleFormat() if preferred.isValid() else None
+
+        min_rate = device.minimumSampleRate() or 1
+        max_rate = device.maximumSampleRate() or 192000
+        min_ch = device.minimumChannelCount() or 1
+        max_ch = device.maximumChannelCount() or 8
+
+        rates = []
+        if pref_rate > 0:
+            rates.append(pref_rate)
+        for rate in _COMMON_RATES:
+            if rate not in rates:
+                rates.append(rate)
+        rates = [r for r in rates if min_rate <= r <= max_rate]
+
+        channels = []
+        if min_ch <= pref_ch <= max_ch:
+            channels.append(pref_ch)
+        for ch in (1, 2):
+            if ch not in channels and min_ch <= ch <= max_ch:
+                channels.append(ch)
+
+        formats = [QAudioFormat.SampleFormat.Int16]
+        if pref_sf is not None and pref_sf not in formats:
+            formats.append(pref_sf)
+        for sf in (
+            QAudioFormat.SampleFormat.Float,
+            QAudioFormat.SampleFormat.Int32,
+            QAudioFormat.SampleFormat.UInt8,
+        ):
+            if sf not in formats:
+                formats.append(sf)
+
+        for sf in formats:
+            for ch in channels:
+                for rate in rates:
+                    fmt = AudioRecorder._make_format(rate, ch, sf)
+                    if device.isFormatSupported(fmt):
+                        return fmt
+
+        if preferred.isValid() and pref_rate > 0 and pref_ch > 0:
+            return preferred
         return None
 
     def _pcm_to_wav(self, raw_pcm):
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(self._fmt.channelCount())
-            wf.setsampwidth(self._fmt.bytesPerSample())
+            wf.setsampwidth(2)
             wf.setframerate(self._fmt.sampleRate())
             wf.writeframes(raw_pcm)
         return buf.getvalue()
@@ -218,3 +361,4 @@ class AudioRecorder(QObject):
             self._source = None
         self._io_device = None
         self._data = bytearray()
+        self._pending = bytearray()
